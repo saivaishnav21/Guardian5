@@ -1,11 +1,10 @@
-from guardian.agents import recon, sbom_graph, suspicious
+from guardian.agents import recon, sbom_graph
 from guardian.agents.base import RunContext
 
 # Ordered agent pipeline. Later phases add: vulnerability, suspicious-change, evidence/risk agents.
 PIPELINE = [
     ("Recon Agent", recon.run),
     ("SBOM & Graph Agent", sbom_graph.run),
-    ("Suspicious Change Agent", suspicious.run),
 ]
 
 
