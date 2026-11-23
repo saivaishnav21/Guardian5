@@ -1,6 +1,9 @@
 import difflib
 import json
+import os
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Mapping
 
@@ -9,17 +12,106 @@ from guardian.schemas import Finding
 
 
 AGENT = "Suspicious Change Agent"
-TAMPERED_BRANCH = "guardian-demo-tampered"
 LIFECYCLE_SCRIPTS = {
     "preinstall", "install", "postinstall", "prepublish", "prepare",
 }
-POPULAR_PACKAGES = {
-    "lodash", "express", "react", "react-dom", "axios", "chalk",
-    "commander", "dotenv", "request", "body-parser", "cors",
-    "mongoose", "morgan", "nodemon", "typescript", "webpack",
-    "babel", "passport", "rxjs", "next", "redux", "fastify",
-    "helmet", "ws", "node-fetch", "bcrypt",
-}
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _groq_api_key() -> str:
+    configured = os.getenv("GROQ_API_KEY", "").strip()
+    if configured:
+        return configured
+
+    source = Path(__file__).resolve()
+    candidates = (
+        source.parents[2] / "api.txt",
+        source.parents[3] / "api.txt",
+    )
+    for path in candidates:
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+    return ""
+
+
+def enrich_findings_with_groq(findings: list[Finding]) -> list[Finding]:
+    """Use Groq only to explain/prioritize existing deterministic findings."""
+    api_key = _groq_api_key()
+    if not api_key or not findings:
+        return findings
+
+    prompt_payload = [
+        {
+            "title": finding.title,
+            "component": finding.component,
+            "severity": finding.severity,
+            "evidence": finding.evidence,
+        }
+        for finding in findings
+    ]
+    prompt = (
+        "You enrich supply-chain security findings. "
+        "Use only the provided evidence. Do not claim facts not present. "
+        "Return a JSON array with one object per input finding containing "
+        "risk_level ('low', 'medium', 'high', or 'critical'), "
+        "ai_summary, and ai_recommended_action.\n"
+        f"Findings: {json.dumps(prompt_payload, ensure_ascii=False)}"
+    )
+    body = json.dumps({
+        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return only valid JSON. Be conservative and evidence-grounded."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        GROQ_API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+        content = response_data["choices"][0]["message"]["content"]
+        enrichment = json.loads(content)
+        if isinstance(enrichment, dict):
+            values = enrichment.get("findings", enrichment)
+            if isinstance(values, dict):
+                values = list(values.values())
+        else:
+            values = enrichment
+        if not isinstance(values, list):
+            return findings
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            json.JSONDecodeError, KeyError, TimeoutError, OSError):
+        return findings
+
+    for finding, item in zip(findings, values):
+        if not isinstance(item, dict):
+            continue
+        risk = str(item.get("risk_level", "")).lower()
+        if risk in {"low", "medium", "high", "critical"}:
+            finding.risk_level = risk
+        summary = item.get("ai_summary")
+        action = item.get("ai_recommended_action")
+        finding.notes.append(str(summary)) if summary else None
+        if action:
+            finding.evidence["groq_recommended_action"] = str(action)
+    return findings
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -70,19 +162,28 @@ def _similarity(left: str, right: str) -> float:
     ).ratio()
 
 
-def detect_typosquat(package_name: str) -> dict | None:
+def detect_typosquat(
+    package_name: str,
+    candidates: set[str] | list[str] | tuple[str, ...] | None = None,
+    threshold: float = 0.87,
+) -> dict | None:
     normalized = package_name.lower().strip()
     if "/" in normalized and normalized.startswith("@"):
         normalized = normalized.rsplit("/", 1)[-1]
-    if normalized in POPULAR_PACKAGES:
+    candidates = set(candidates or [])
+    candidates = {
+        str(candidate).lower().strip().rsplit("/", 1)[-1]
+        for candidate in candidates
+    }
+    if not candidates or normalized in candidates:
         return None
 
     target = max(
-        POPULAR_PACKAGES,
-        key=lambda popular: _similarity(normalized, popular),
+        candidates,
+        key=lambda candidate: _similarity(normalized, candidate),
     )
     score = _similarity(normalized, target)
-    if score < 0.87:
+    if score < threshold:
         return None
 
     return {
@@ -133,6 +234,112 @@ def _base_branch(repo: Path) -> str:
     return "HEAD"
 
 
+def _tampered_branch(repo: Path) -> str:
+    configured = os.getenv("GUARDIAN_TAMPERED_BRANCH", "").strip()
+    if configured:
+        return configured
+    result = _run_git(
+        repo,
+        "config",
+        "--get",
+        "guardian.tamperedBranch",
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return "guardian-demo-tampered"
+
+
+def detect_install_scripts(
+    lockfile: Mapping,
+    package_json: Mapping | None = None,
+) -> list[dict]:
+    """Return install lifecycle findings from package and lockfile data."""
+    findings = []
+
+    if isinstance(package_json, Mapping):
+        scripts = package_json.get("scripts")
+        if isinstance(scripts, Mapping):
+            lifecycle = sorted(set(scripts) & LIFECYCLE_SCRIPTS)
+            if lifecycle:
+                findings.append({
+                    "type": "suspicious_change",
+                    "package": str(package_json.get("name") or "root-package"),
+                    "severity": "high",
+                    "evidence": {
+                        "what_changed": (
+                            f"Lifecycle scripts declared: {', '.join(lifecycle)}"
+                        ),
+                        "where": "package.json",
+                        "why_suspicious": (
+                            "Install lifecycle scripts can execute code during setup"
+                        ),
+                        "scripts": lifecycle,
+                    },
+                })
+
+    for name, details in _package_entries(lockfile).items():
+        scripts = details.get("scripts")
+        lifecycle = (
+            sorted(set(scripts) & LIFECYCLE_SCRIPTS)
+            if isinstance(scripts, Mapping)
+            else []
+        )
+        if details.get("hasInstallScript") or lifecycle:
+            findings.append({
+                "type": "suspicious_change",
+                "package": name,
+                "severity": "high",
+                "evidence": {
+                    "what_changed": "Package has install-time lifecycle behavior",
+                    "where": "package-lock.json",
+                    "why_suspicious": (
+                        "hasInstallScript is true or an install lifecycle script "
+                        "is declared"
+                    ),
+                    "scripts": lifecycle,
+                },
+            })
+    return findings
+
+
+def detect_non_registry_resolutions(lockfile: Mapping) -> list[dict]:
+    """Return findings for git, HTTP, and direct lockfile resolutions."""
+    findings = []
+    for name, details in _package_entries(lockfile).items():
+        values = (
+            details.get("resolved"),
+            details.get("from"),
+            details.get("version"),
+        )
+        resolutions = [
+            str(value) for value in values
+            if isinstance(value, str) and value
+        ]
+        outside_registry = [
+            value for value in resolutions
+            if value.startswith((
+                "git+", "git://", "github:", "http://", "https://",
+                "ssh://", "file:", "github.com/",
+            ))
+            and "/-/" not in value
+        ]
+        if outside_registry:
+            findings.append({
+                "type": "suspicious_change",
+                "package": name,
+                "severity": "high",
+                "evidence": {
+                    "what_changed": "Lockfile has a repository or direct URL resolution",
+                    "where": "package-lock.json",
+                    "why_suspicious": (
+                        "The dependency is not resolved by normal registry metadata"
+                    ),
+                    "resolutions": outside_registry,
+                },
+            })
+    return findings
+
+
 def run(ctx: RunContext) -> None:
     recon = ctx.state.get("recon", {})
     target_dir = recon.get("target_dir")
@@ -146,7 +353,10 @@ def run(ctx: RunContext) -> None:
     package_json = _read_json(package_path) or {}
     lockfile = _read_json(lockfile_path) or {}
     findings: list[Finding] = []
-
+    tampered_branch = _tampered_branch(repo)
+    base = _base_branch(repo)
+    base_package = _json_at_revision(repo, base, "package.json")
+    base_lockfile = _json_at_revision(repo, base, "package-lock.json")
     dependencies = {}
     if isinstance(package_json, Mapping):
         if isinstance(package_json.get("dependencies"), Mapping):
@@ -154,8 +364,17 @@ def run(ctx: RunContext) -> None:
         if isinstance(package_json.get("devDependencies"), Mapping):
             dependencies.update(package_json["devDependencies"])
 
+    candidate_names = set(dependencies)
+    if base_package:
+        for section in ("dependencies", "devDependencies"):
+            values = base_package.get(section)
+            if isinstance(values, Mapping):
+                candidate_names.update(str(name) for name in values)
+    if base_lockfile:
+        candidate_names.update(_package_entries(base_lockfile))
+
     for name in dependencies:
-        match = detect_typosquat(str(name))
+        match = detect_typosquat(str(name), candidates=candidate_names)
         if match:
             findings.append(_finding(
                 len(findings) + 1,
@@ -171,7 +390,7 @@ def run(ctx: RunContext) -> None:
                     ),
                     "similar_to": match["target"],
                     "confidence": match["score"],
-                    "branch": TAMPERED_BRANCH,
+                    "branch": tampered_branch,
                 },
             ))
 
@@ -191,7 +410,7 @@ def run(ctx: RunContext) -> None:
                         "Install lifecycle scripts can execute code during setup"
                     ),
                     "scripts": found_scripts,
-                    "branch": TAMPERED_BRANCH,
+                    "branch": tampered_branch,
                 },
             ))
 
@@ -211,6 +430,7 @@ def run(ctx: RunContext) -> None:
                 "git+", "git://", "github:", "http://", "https://",
                 "ssh://", "file:", "github.com/",
             ))
+            and "/-/" not in value
         ]
         if outside_registry:
             findings.append(_finding(
@@ -225,7 +445,7 @@ def run(ctx: RunContext) -> None:
                         "The dependency is not resolved by normal registry metadata"
                     ),
                     "resolutions": outside_registry,
-                    "branch": TAMPERED_BRANCH,
+                    "branch": tampered_branch,
                 },
             ))
 
@@ -249,19 +469,17 @@ def run(ctx: RunContext) -> None:
                         "is declared"
                     ),
                     "scripts": lifecycle,
-                    "branch": TAMPERED_BRANCH,
+                    "branch": tampered_branch,
                 },
             ))
 
     fetch = _run_git(repo, "fetch", "origin",
-                     f"{TAMPERED_BRANCH}:refs/remotes/origin/{TAMPERED_BRANCH}",
+                     f"{tampered_branch}:refs/remotes/origin/{tampered_branch}",
                      "--depth=1")
     if fetch.returncode == 0:
         base = _base_branch(repo)
-        compare = f"origin/{TAMPERED_BRANCH}"
-        base_package = _json_at_revision(repo, base, "package.json")
+        compare = f"origin/{tampered_branch}"
         current_package = _json_at_revision(repo, compare, "package.json")
-        base_lockfile = _json_at_revision(repo, base, "package-lock.json")
         current_lockfile = _json_at_revision(repo, compare, "package-lock.json")
 
         if base_package is not None and current_package is not None:
@@ -284,7 +502,7 @@ def run(ctx: RunContext) -> None:
                         "why_suspicious": "Dependency is absent from the base branch",
                         "old_value": None,
                         "new_value": after[name],
-                        "branch": TAMPERED_BRANCH,
+                        "branch": tampered_branch,
                     },
                 ))
 
@@ -304,7 +522,7 @@ def run(ctx: RunContext) -> None:
                         "why_suspicious": "Package is absent from the base lockfile",
                         "old_value": None,
                         "new_value": after_entries[name].get("version"),
-                        "branch": TAMPERED_BRANCH,
+                        "branch": tampered_branch,
                     },
                 ))
 
@@ -325,7 +543,7 @@ def run(ctx: RunContext) -> None:
                             ),
                             "old_value": before.get("integrity"),
                             "new_value": after.get("integrity"),
-                            "branch": TAMPERED_BRANCH,
+                            "branch": tampered_branch,
                         },
                     ))
                 if before.get("resolved") != after.get("resolved"):
@@ -342,16 +560,18 @@ def run(ctx: RunContext) -> None:
                             ),
                             "old_value": before.get("resolved"),
                             "new_value": after.get("resolved"),
-                            "branch": TAMPERED_BRANCH,
+                            "branch": tampered_branch,
                         },
                     ))
+
+    findings = enrich_findings_with_groq(findings)
 
     for finding in findings:
         ctx.add_finding(finding)
 
     ctx.state["suspicious"] = {
         "finding_count": len(findings),
-        "tampered_branch": TAMPERED_BRANCH,
+        "tampered_branch": tampered_branch,
     }
     ctx.save("suspicious.json", ctx.state["suspicious"])
     ctx.note(
