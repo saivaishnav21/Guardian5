@@ -1,3 +1,3 @@
-from . import suspicious
+from . import suspicious, vulnerability
 
-__all__ = ["suspicious"]
+__all__ = ["suspicious", "vulnerability"]

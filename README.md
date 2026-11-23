@@ -2,8 +2,8 @@
 
 The current pipeline clones a public GitHub repository, inventories known project files,
 generates a CycloneDX SBOM with cdxgen, exports a dependency graph, and runs the
-suspicious-change agent. Vulnerability and container/CI scanning are not yet connected
-to the pipeline.
+suspicious-change agent. The optional Grype vulnerability stage is connected when
+`grype` is available. Container/CI and evidence/risk reporting remain separate work.
 
 ## Setup (PowerShell)
 
