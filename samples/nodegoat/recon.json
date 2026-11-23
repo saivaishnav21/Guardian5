@@ -1,0 +1,23 @@
+{
+  "repo_url": "https://github.com/OWASP/NodeGoat.git",
+  "commit": "c5cb68a7084e4ae7dcc60e6a98768720a81841e8",
+  "target_dir": "runs\\20261123-153417\\target",
+  "ecosystems": [
+    "npm"
+  ],
+  "manifests": [
+    "package-lock.json",
+    "package.json"
+  ],
+  "dockerfiles": [
+    "Dockerfile"
+  ],
+  "compose_files": [
+    "docker-compose.yml"
+  ],
+  "ci_workflows": [
+    ".github\\workflows\\e2e-test.yml",
+    ".github\\workflows\\lint.yml"
+  ],
+  "actions_taken": []
+}
