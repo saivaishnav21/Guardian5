@@ -3,6 +3,7 @@ import shutil
 import subprocess
 
 from guardian.agents.base import RunContext
+from guardian.agents.groq_recon import suggest_manifests
 
 AGENT = "Recon Agent"
 
@@ -18,6 +19,11 @@ ECOSYSTEM_FILES = {
 }
 NPM_LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
 COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+PRIORITY_MANIFEST_SUFFIXES = {
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".lock", ".gradle", ".mod", ".sum", ".txt",
+    ".kts", ".sbt", ".csproj", ".fsproj", ".gemspec", ".podspec",
+}
+MAX_GROQ_CANDIDATES = 200
 
 
 def run(ctx: RunContext) -> None:
@@ -35,6 +41,7 @@ def run(ctx: RunContext) -> None:
 
     found = {"manifests": [], "dockerfiles": [], "compose_files": [], "ci_workflows": []}
     ecosystems = set()
+    unknown_candidates = []
 
     for p in dest.rglob("*"):
         if not p.is_file():
@@ -46,6 +53,8 @@ def run(ctx: RunContext) -> None:
         if name in ECOSYSTEM_FILES:
             found["manifests"].append(str(rel))
             ecosystems.add(ECOSYSTEM_FILES[name])
+        elif p.suffix.lower() in PRIORITY_MANIFEST_SUFFIXES or not p.suffix:
+            unknown_candidates.append(rel.as_posix())
         if name.lower().startswith("dockerfile") or name.lower().endswith(".dockerfile"):
             found["dockerfiles"].append(str(rel))
         if name in COMPOSE_NAMES:
@@ -60,17 +69,25 @@ def run(ctx: RunContext) -> None:
     if (dest / "package.json").exists() and not has_lock:
         npm = shutil.which("npm")
         if not npm:
-            raise RuntimeError("npm not found. Install Node.js 20 LTS first.")
+            raise RuntimeError("npm not found. Install Node.js and npm first.")
         ctx.note(AGENT, "no lockfile found, generating one (lockfile-only, scripts disabled)")
         subprocess.run([npm, "install", "--package-lock-only", "--ignore-scripts"],
                        cwd=dest, check=True)
         actions.append("generated package-lock.json via npm --package-lock-only --ignore-scripts")
+
+    unknown_candidates.sort(key=lambda path: (path.count("/"), path))
+    ai_recon = suggest_manifests(unknown_candidates[:MAX_GROQ_CANDIDATES])
+    ai_recon["candidate_count"] = len(unknown_candidates)
+    ai_recon["submitted_count"] = min(len(unknown_candidates), MAX_GROQ_CANDIDATES)
+    if ai_recon["status"] == "error":
+        ctx.note(AGENT, f"Groq suggestions unavailable ({ai_recon['error_type']}); continuing")
 
     recon = {
         "repo_url": url,
         "commit": commit,
         "target_dir": str(dest),
         "ecosystems": sorted(ecosystems),
+        "ai_recon": ai_recon,
         **found,
         "actions_taken": actions,
     }

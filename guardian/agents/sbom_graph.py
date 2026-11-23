@@ -9,9 +9,6 @@ AGENT = "SBOM & Graph Agent"
 
 def run(ctx: RunContext) -> None:
     recon = ctx.state["recon"]
-    if "npm" not in recon["ecosystems"]:
-        raise NotImplementedError(f"Ecosystems {recon['ecosystems']} not supported yet (npm only).")
-
     sbom_path = str(ctx.run_dir / "sbom.cdx.json")
     ctx.note(AGENT, "generating CycloneDX SBOM with cdxgen")
     generate_sbom(recon["target_dir"], sbom_path)
