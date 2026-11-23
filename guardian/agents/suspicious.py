@@ -1,4 +1,3 @@
-import difflib
 import json
 import os
 import subprocess
@@ -9,6 +8,11 @@ from typing import Mapping
 
 from guardian.agents.base import RunContext
 from guardian.schemas import Finding
+
+try:
+    from rapidfuzz.fuzz import WRatio
+except ImportError:
+    WRatio = None
 
 
 AGENT = "Suspicious Change Agent"
@@ -157,9 +161,9 @@ def _package_entries(lockfile: Mapping) -> dict[str, Mapping]:
 
 
 def _similarity(left: str, right: str) -> float:
-    return difflib.SequenceMatcher(
-        None, left.lower(), right.lower()
-    ).ratio()
+    if WRatio is not None:
+        return float(WRatio(left, right)) / 100.0
+    return 0.0
 
 
 def detect_typosquat(
@@ -340,6 +344,58 @@ def detect_non_registry_resolutions(lockfile: Mapping) -> list[dict]:
     return findings
 
 
+def lockfile_diff(before: Mapping, after: Mapping) -> list[dict]:
+    """Return package additions and version, resolved URL, and integrity changes."""
+    findings = []
+    before_entries = _package_entries(before)
+    after_entries = _package_entries(after)
+
+    for name in sorted(set(after_entries) - set(before_entries)):
+        findings.append({
+            "type": "suspicious_change",
+            "package": name,
+            "severity": "medium",
+            "evidence": {
+                "what_changed": f"Lockfile dependency {name} was added",
+                "where": "package-lock.json",
+                "why_suspicious": "Package is absent from the base lockfile",
+                "old_value": None,
+                "new_value": after_entries[name].get("version"),
+            },
+        })
+
+    for name in sorted(set(before_entries) & set(after_entries)):
+        old = before_entries[name]
+        new = after_entries[name]
+        if old.get("integrity") != new.get("integrity"):
+            findings.append({
+                "type": "suspicious_change",
+                "package": name,
+                "severity": "high",
+                "evidence": {
+                    "what_changed": f"Integrity hash for {name} changed",
+                    "where": "package-lock.json",
+                    "why_suspicious": "The package digest differs from the base lockfile",
+                    "old_value": old.get("integrity"),
+                    "new_value": new.get("integrity"),
+                },
+            })
+        if old.get("resolved") != new.get("resolved"):
+            findings.append({
+                "type": "suspicious_change",
+                "package": name,
+                "severity": "high",
+                "evidence": {
+                    "what_changed": f"Resolution for {name} changed",
+                    "where": "package-lock.json",
+                    "why_suspicious": "The package source differs from the base lockfile",
+                    "old_value": old.get("resolved"),
+                    "new_value": new.get("resolved"),
+                },
+            })
+    return findings
+
+
 def run(ctx: RunContext) -> None:
     recon = ctx.state.get("recon", {})
     target_dir = recon.get("target_dir")
@@ -364,7 +420,7 @@ def run(ctx: RunContext) -> None:
         if isinstance(package_json.get("devDependencies"), Mapping):
             dependencies.update(package_json["devDependencies"])
 
-    candidate_names = set(dependencies)
+    candidate_names = set()
     if base_package:
         for section in ("dependencies", "devDependencies"):
             values = base_package.get(section)
@@ -481,7 +537,18 @@ def run(ctx: RunContext) -> None:
         compare = f"origin/{tampered_branch}"
         current_package = _json_at_revision(repo, compare, "package.json")
         current_lockfile = _json_at_revision(repo, compare, "package-lock.json")
+        branch_available = current_package is not None or current_lockfile is not None
+    else:
+        local = _run_git(repo, "rev-parse", "--verify", tampered_branch)
+        if local.returncode == 0:
+            compare = tampered_branch
+            current_package = _json_at_revision(repo, compare, "package.json")
+            current_lockfile = _json_at_revision(repo, compare, "package-lock.json")
+            branch_available = current_package is not None or current_lockfile is not None
+        else:
+            branch_available = False
 
+    if branch_available:
         if base_package is not None and current_package is not None:
             before = {}
             after = {}
