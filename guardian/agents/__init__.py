@@ -1,3 +1,13 @@
-from . import suspicious, vulnerability
+from . import (
+    risk_assessment,
+    remediation,
+    suspicious,
+    vulnerability,
+)
 
-__all__ = ["suspicious", "vulnerability"]
+__all__ = [
+    "risk_assessment",
+    "remediation",
+    "suspicious",
+    "vulnerability",
+]
