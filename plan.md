@@ -1,193 +1,224 @@
-# Day 2 plan: prioritize, propose, validate, verify
+# Day 2: The Guardian's Brain and Shield
 
-## Goal
+## Mission and demo scope
 
-Turn a Day 1 finding into a **reviewable, tested remediation proposal**. The demo
-should show the original evidence, why the issue matters, the proposed change,
-what happened in an isolated build and test, the before-and-after scan, and the
-human decision. The target repository is never silently changed, merged, or
-deployed.
+Take **one real, bounded finding** from detection to a reviewable remediation:
+explain its priority, propose an exact change, test that change in an isolated
+copy, rescan it, and present the evidence to a human reviewer. Investigate one
+non-CVE suspicious change as a second case. Expand to more findings only after
+this complete path works.
 
-```text
-Day 1 baseline scan
-    -> investigate suspicious changes and assess risk
-    -> propose a fix with supporting evidence
-    -> decide whether an isolated attempt may run automatically
-    -> apply the candidate in a sandbox; build and test it
-    -> rescan and compare with the baseline
-    -> human reviews the exact proposal and validation record
-    -> approved change can be handed off for a separate merge or deployment
+The outcome is a **verified proposal**, not an automatic merge or deployment.
+The original repository and its default branch remain untouched. An automated
+agent may prepare and test a patch in a disposable sandbox; a human must approve
+the exact patch and results before any separate adoption step.
+
+```mermaid
+flowchart LR
+    A[Baseline finding] --> B[Contextual risk]
+    A --> C[Non-CVE investigation]
+    B --> D[Fix proposal]
+    C --> D
+    D --> E[Evidence challenge and policy gate]
+    E --> F[Isolated patch, build and tests]
+    F --> G[Rescan and compare]
+    G --> H[Human review]
+    H --> I[Approved proposal or rejected record]
 ```
 
-## What Day 1 already gives us
+## Day 1 baseline that Day 2 builds on
 
-- A CycloneDX SBOM, component graph, dependency paths where available, and a
-  commit SHA for the scanned repository.
-- Grype vulnerability observations, advisory IDs, severity, and **possible fixed
-  versions**. Trivy can add observations from an already-built local image.
-- Suspicious npm/lockfile checks, static Docker/CI checks, findings, and scan
-  coverage statuses.
-- A severity-based initial risk label, generic remediation guidance, a concise
-  Markdown report, and complete JSON evidence.
+Day 2 starts from the existing Guardian scan, not from a new detector. Recon
+records the repository and commit; cdxgen supplies the CycloneDX SBOM; the graph
+records components and dependency paths. Grype and optional Trivy supply
+vulnerability observations and fixed-version hints. Suspicious-change and
+Docker/CI checks provide non-CVE evidence. The Evidence and Risk Agent produces
+initial severity-based ratings, while the Markdown/JSON report and Streamlit app
+show the results. Day 2 consumes these saved artifacts and adds contextual
+decisions, candidate changes, controlled validation, and before/after proof.
+The Day 2 contract uses the saved evidence and status fields, so it does not
+depend on how the Day 1 agents internally produced them.
 
-These are inputs, not finished Day 2 decisions. An advisory's fixed version does
-not tell us which direct dependency to change, whether the application accepts
-that version, whether tests pass, or whether a new risk appears. Current risk
-labels do not establish exploitability, reachability, exposure, or provenance.
-The current report does not compare a candidate against the baseline.
+The distinction matters: an advisory version is a **fix candidate**, and an
+initial severity label is a **starting point for prioritization**. Neither is
+already a tested remediation or a measured claim of exploitability.
 
-## Five-person split
+## Problems the design must solve
 
-| Owner | Day 1 background | Day 2 responsibility | Output and acceptance check |
-| --- | --- | --- | --- |
-| **Person 1 — contextual risk** | Recon, SBOM, dependency graph | Rank findings using scanner severity plus **observed** application context. Use the graph to identify direct/transitive ownership; add reachability or exposure only when measured. An LLM may explain the ranking from cited evidence and identify questions for review. | `risk_assessment.json`: score, level, evidence references, unknowns, and rationale. The same inputs give a reproducible ranking without the LLM. |
-| **Person 2 — remediation planner** | Vulnerability matching | Turn advisory fixed-version hints into candidate actions: upgrade the right direct dependency, update a lockfile, replace/remove a package, update a base image, or propose a mitigation when no fix exists. Use an LLM only to draft a plan from verified facts; validate its structured output before use. | `proposals.json` plus a patch for eligible cases: affected finding keys, exact versions/files, expected benefit, compatibility concerns, rollback, and evidence. No fabricated version or unbounded edit. |
-| **Person 3 — investigation and approval gate** | Suspicious-change detection | Investigate at least one non-CVE risk (for example integrity, provenance, install script, or unexpected source change). Build the policy and human decision flow for proposed changes. A person, not the agent, grants final approval. | `investigations.json` and `approvals.json`: evidence, decision, reviewer, time, base commit, and exact patch hash. A changed patch or base commit invalidates approval. |
-| **Person 4 — sandbox build and test** | Container and CI inspection, local image scan | Create an isolated candidate workspace at the baseline commit. Apply only the selected patch there, build the app/image, run available tests, capture logs, and classify failures against baseline behavior. | `validation.json` plus build/test logs: environment, commands, exit codes, timeouts, changed files, baseline comparison, and an explicit `passed`, `failed`, or `inconclusive` result. |
-| **Person 5 — rescan and final report** | Evidence/risk, Streamlit app, Markdown/JSON reports | Rescan the candidate with the same available detectors; compare SBOMs, findings, and scan coverage. Present original risk, proposed action, approval, build/test outcome, remaining/new findings, and an audit trail. | `verification.json` and concise Day 2 report. Every claim links to baseline or candidate evidence; the full JSON remains available. |
+| Problem | Day 2 fix | Proof that it worked |
+| --- | --- | --- |
+| Severity alone can overstate or understate application risk. | Person 1 records observed context and unknowns; the LLM challenges evidence but cannot invent reachability. | Every rank has factors and evidence references; unknown stays unknown. |
+| A fixed transitive package version may not be installable through the application's direct dependencies. | Person 2 traces the owner with the graph and package manager, checks constraints, and proposes a bounded compatible change or `mitigation_only`. | Proposal names the direct owner, exact version source, constraint result, and changed files. |
+| A demo target may build but lack runnable baseline application tests. | Person 4 trials the target first, then uses comparable baseline/candidate test environments or chooses a verified alternative. `npm audit` and `npm ls` stay diagnostic. | A passing candidate is supported by real application tests, or the result is `inconclusive`. |
+| An LLM confidence number could be mistaken for permission to change code. | Require deterministic proposal gates; high confidence only permits an isolated sandbox attempt. Person 3 records final human approval of the exact patch. | No original-checkout edit, merge, or deployment occurs from confidence alone. |
+| Five agents could exchange incompatible files or become stuck in many workflow states. | Freeze small versioned artifacts first, use five stages with independent outcomes, and log retries as events. | Each stage can read a fixture and produce a validated artifact independently. |
+| Agent debate could produce confident but unsupported claims. | Limit it to one evidence challenge and rebuttal; record disagreements and send unresolved cases to review. | Each claim cites existing evidence; no vote can turn a failed test into a pass. |
+| A build may run unsafe scripts or alter the host. | Person 4 uses a disposable workspace and constrained container, with no host secrets or Docker socket inside the target. | Only the candidate copy changes; commands, network access, and exit codes are logged. |
+| A rescan can appear clean because a scanner was missing, settings changed, or finding IDs moved. | Person 5 compares equivalent coverage using stable finding keys and explicit `not_run`/`unverified` results. | Report separates resolved, remaining, new, and unverified findings with raw evidence links. |
 
-Person 3 owns the **approval mechanism**; the actual reviewer is a human. Person
-4 owns the sandbox, while Person 5 owns the independent after-scan. They should
-agree on file formats before coding so the stages can run separately.
+## Five owners and handoffs
 
-## Risk analysis: evidence first, AI second
+| Owner | Deliverable | Handoff condition |
+| --- | --- | --- |
+| **Person 1: Contextual Risk Agent** | Rank findings from observed severity, dependency ownership, and any measured exposure or reachability. Produce `risk_assessment.json` with score, confidence, evidence references, and unknowns. Use an LLM to explain or challenge the evidence, not to invent it. | Person 2 receives a ranked finding with traceable reasons. Unknown exposure or reachability stays unknown. |
+| **Person 2: Remediation Agent** | Use advisory fixed-version hints and the dependency graph to find the actual manifest owner. Check version constraints; produce `proposal.json` and a bounded patch, or a clear `mitigation_only`/`manual_review` result. | Person 4 receives a specific patch, affected files, expected risk reduction, compatibility concern, rollback, and patch hash. |
+| **Person 3: Suspicious Investigation and Approval Gate** | Investigate one non-CVE signal using repository evidence. Implement the decision policy and a simple review screen for `approve`, `reject`, or `request_changes`; record the human's decision. | The review record binds the reviewer, baseline commit, proposal ID, patch hash, validation result, and decision time. Person 5 can display it. |
+| **Person 4: Sandbox Build and Test** | Apply the candidate only in an isolated workspace, then run comparable baseline/candidate builds and application tests. Capture the patch diff, commands, logs, tool versions, and outcomes in `validation.json`. | Person 5 receives `passed`, `failed`, or `inconclusive` with evidence. Missing tests or tools are never treated as a pass. |
+| **Person 5: Rescan and Verification Report** | Rescan the candidate, compare it with baseline, and show resolved, remaining, new, and unverified findings. Produce `verification.json` plus a concise Day 2 report and a full evidence download. Integrate Person 3's review component into Streamlit. | A reviewer can inspect the exact change, build/test result, before/after risk, scan coverage, and approval record in one place. |
 
-Person 1 should separate **risk level** from **confidence in the assessment**.
-Start with a transparent, configurable ranking rule using only fields we have:
-severity, affected component, dependency path, whether a fix is known, and
-documented exposure or reachability evidence. Unknown is a valid value. Do not
-turn an absent dependency path into “unreachable,” or a high CVSS/severity into
-“exploitable here.” Record which inputs raised or lowered the rank.
+The five outputs above are the contracts between teammates. Person 3 owns the
+approval **mechanism**; a human reviewer makes the decision. Person 5 owns the
+report and app integration, including displaying the approval evidence.
 
-The LLM's role is to explain the supplied evidence and highlight missing context.
-It must not invent CVEs, code paths, deployed exposure, or package versions. Store
-its text as a draft, validate identifiers and cited evidence keys, and keep the
-deterministic ranking available when the API is missing or fails. A model's
-self-reported confidence is not a security control.
+## First task: freeze a small shared contract
 
-## Fix proposals and confidence gates
+Before implementing agents, agree on `guardian/schemas_day2.py` (or equivalent
+validated models) and one example JSON file per stage. Avoid a single oversized
+object that every person edits. All artifacts carry `schema_version`,
+`repo_url`, `baseline_commit`, a `case_id` assigned from the baseline finding,
+`created_at`, `status`, and paths to their source evidence. `proposal_id` is
+assigned when Person 2 creates a proposal and is carried by later stages.
+Stage-specific fields are:
 
-Person 2 should produce a **candidate**, not claim a verified fix. A Grype or
-Trivy fixed version is a starting point. For a transitive package, inspect the
-graph and manifest constraints to find the direct dependency that can actually
-be changed. If the proposed version violates constraints or no patched version
-exists, propose replacement, removal, mitigation, or manual review instead of
-inventing an upgrade. Keep the patch small and list every changed file.
-Do not ask an agent to fix every finding in one uncontrolled patch. Start with
-one finding, or a bounded group that shares the same direct dependency; verify
-it, then repeat. This makes failures and risk changes attributable to a change.
+| Artifact | Required fields |
+| --- | --- |
+| `risk_assessment.json` | `finding_key`, `source_finding_ids`, `score`, `risk_level`, `confidence`, `factors`, `unknowns`, `evidence_refs` |
+| `investigation.json` | `finding_key`, `claim`, `observations`, `inferences`, `evidence_refs`, `confidence` |
+| `proposal.json` | `finding_keys`, `action`, `target_files`, `from_version`, `to_version`, `constraint_check`, `patch_path`, `patch_sha256`, `rollback`, `proposal_confidence`, `evidence_refs` |
+| `validation.json` | `baseline_commit`, `patch_sha256`, `environment`, `baseline_build`, `candidate_build`, `baseline_tests`, `candidate_tests`, `changed_files`, `logs`, `result` |
+| `verification.json` | `baseline_scan`, `candidate_scan`, `resolved`, `remaining`, `new`, `unverified`, `coverage_differences`, `result` |
+| `approval.json` | `proposal_id`, `baseline_commit`, `patch_sha256`, `decision`, `reviewer`, `reviewed_at`, `reason`; final adoption decisions also require `validation_ref` and `verification_ref` |
 
-Use three separate fields:
+Use explicit enums and validation for status and action fields. Store files under
+the run directory; do not overwrite baseline artifacts. A Day 1 ordinal ID such
+as `VULN-001` may change after a rescan. Use a stable comparison key based on
+advisory or check ID, canonical package identity **without its version**, source
+detector, and affected artifact. Keep installed version as an observation. This
+lets Person 5 recognize the same issue before and after an upgrade.
 
-1. **Risk confidence:** how well the threat to this application is supported.
-2. **Proposal confidence:** how well a specific change is supported by advisories,
-   dependency constraints, and the allowed edit scope.
-3. **Validation result:** what the sandbox and after-scan actually demonstrated.
+Keep orchestration simple: `assessed -> proposed -> sandboxed -> rescanned ->
+reviewed`. Each stage separately records `completed`, `failed`, `inconclusive`,
+or `not_run`; a stage name never means that its result passed. Log attempts and
+retries as events, rather than adding many transition states. A changed baseline
+commit or patch hash starts a new proposal and invalidates an old approval.
 
-An initial configurable threshold (for example, proposal confidence >= 0.85)
-may allow an **automatic attempt in the disposable sandbox** only when all
-deterministic gates pass: a real fixed version, a known affected component, a
-bounded patch, no secret or infrastructure change, and an available sandbox.
-This number is a pilot setting, not a calibrated probability; measure false
-positives and adjust it using test fixtures. A low-confidence or policy-sensitive
-proposal is sent to a reviewer before any patch attempt. Neither threshold
-authorizes merging, deployment, or changes to the original target. Final adoption
-always requires human approval of the exact patch and validation evidence.
+## Person 1: risk ranking with bounded AI reasoning
 
-## Person 3: approval record and policy
+Use a deterministic score with recorded factors: advisory severity, whether the
+dependency is direct or transitive, evidence that the affected component is used
+in production, measured reachability/exposure, and suspicious/provenance signals.
+An unknown factor contributes no invented fact. Show both **risk level** and
+**confidence in that assessment**. No dependency path does not mean unreachable;
+a CVE's severity does not prove exploitability in this app.
 
-The review screen or CLI record should show the finding and evidence, proposed
-diff, dependency and version rationale, expected risk reduction, compatibility
-concerns, rollback, sandbox logs, and before/after scan. Available decisions:
-`approve`, `reject`, and `request_changes`. Store reviewer identity, timestamp,
-reason, baseline commit, target repo, and patch hash. Reapproval is required if
-any of those inputs change. Do not put API keys, source secrets, or raw credentials
-in approval files or LLM prompts.
+An LLM may provide a short evidence-cited challenge: "Which input supports this
+rank? What is missing?" Require structured output with references to existing
+evidence IDs. Reject unsupported IDs, versions, or claims of reachability. The
+model's confidence number does not itself change a score. If the API is absent,
+the deterministic assessment still works.
 
-The policy gate can let a high-confidence candidate enter the sandbox without
-interrupting a person. It cannot treat “the model said 95%” as approval. An
-approved proposal is a handoff for a separate source-control action; Day 2 does
-not auto-merge or deploy it.
+## Person 2: fix the right dependency, then challenge the proposal
 
-## Person 4: isolated build and test
+Scanner `fixed_versions` are **candidate versions**, not a complete fix. Before
+editing, use the dependency graph and ecosystem tool (for npm, `npm ls <package>`)
+to identify the direct package that owns a vulnerable transitive dependency.
+Check manifest and lockfile constraints, and whether a candidate can be resolved.
+If no compatible upgrade exists, return `mitigation_only` or `manual_review` with
+the reason. For a direct dependency, pin or upgrade only to a verified candidate
+from advisory/package metadata. Do not let an LLM invent a version or shell command.
 
-- Copy or create a fresh worktree at the **exact baseline commit**. Apply the
-  proposed patch only to that disposable copy. Record the diff before running
-  commands and reject unexpected file changes.
-- Run builds and tests in a container or equivalent isolated environment with
-  no host secrets, no privileged mode, no Docker socket inside the target, and
-  bounded time, CPU, memory, disk, and network access. Allow network only where
-  dependency installation truly needs it and record that access.
-- Use reviewed command templates for the detected ecosystem. Do not execute an
-  arbitrary shell command supplied by an LLM or by the target repository without
-  a deliberate sandbox policy. Record tool versions, base image, exit codes, and
-  logs. An unavailable tool is `not_run`, not `passed`.
-- Run the baseline and candidate tests in comparable environments. NodeGoat's
-  production image currently lacks `grunt-cli`, so its `npm test` fails there
-  before any fix. That is a baseline limitation, not proof of a regression or of
-  a successful remediation. Choose a demo target with runnable tests or create a
-  controlled test environment for that target.
-- Keep all changed artifacts in the run directory. Never overwrite the original
-  checkout. A build/test failure, timeout, or missing test suite makes validation
-  `failed` or `inconclusive`; it does not silently pass.
+The patch generator should modify only listed files in a disposable workspace.
+Begin with one finding or a small group sharing the same direct owner. Record a
+unified diff and SHA-256 hash. Include a rollback instruction and a note about
+possible API or behavior changes. The AI agent may draft the explanation and
+propose a change, but structured validation and dependency tools decide whether
+that proposal is eligible to test.
 
-## Person 5: rescan and compare
+For the promised multi-agent reasoning, run **one bounded evidence challenge**
+before sandboxing: Person 1 states the risk, Person 2 states fix feasibility, and
+Person 3 checks suspicious-change context. The orchestrator stores each claim,
+its evidence references, disagreement, and final disposition in
+`reasoning_log.json`. It does not manufacture a consensus or let agents vote a
+missing test into a pass. Unresolved disagreement lowers proposal eligibility
+and goes to human review. One round and one short rebuttal are enough for the
+demo; no open-ended agent debate.
 
-Run the same available SBOM and vulnerability tools on baseline and candidate,
-with versions and scan coverage recorded. Compare component versions, introduced
-and removed dependencies, vulnerability observations, suspicious changes, and
-container/CI findings. A finding's Day 1 ordinal ID (such as `VULN-001`) is not
-stable between scans; introduce a stable comparison key from the advisory ID,
-package URL/name, installed version, source, and affected artifact.
+## Confidence and human approval
 
-The final report must distinguish `resolved`, `remaining`, `new`, `unverified`,
-and `not_scanned`. Passing tests alone does not prove a vulnerability is gone;
-a clean rescan alone does not prove the application still works. If scanner
-coverage differs, report that explicitly. Grype and Trivy may describe the same
-issue, so group related observations while preserving both raw evidence records.
-Show the approval decision and validation status next to the proposed action.
+Keep **risk confidence**, **proposal confidence**, and **validation result**
+separate. Proposal confidence is based on verified signals: known fix source,
+correct dependency owner, compatible constraints, narrow patch, and explicit
+rollback. Treat an initial threshold such as `>= 0.85` as a configurable demo
+gate, not a calibrated probability.
 
-## Shared implementation contract
+If required signals pass and proposal confidence meets the threshold, the system
+may automatically try the patch **only inside Person 4's disposable sandbox**.
+Low-confidence, no-fix, infrastructure-changing, or disputed proposals require
+a recorded preflight human decision before any attempt. After the sandbox and rescan, **every** proposed
+change still needs a human decision before it can be adopted. No confidence
+threshold authorizes a write to the original checkout, a PR merge, or deployment.
 
-Before parallel coding, agree on one proposal and validation schema. Each stage
-should consume a saved JSON artifact and write a new one under the run directory.
-Minimum common fields: `repo_url`, `baseline_commit`, `finding_key`,
-`source_finding_ids`, `evidence_refs`, `status`, `reason`, and artifact paths.
-Proposals add `action`, `target_files`, `from_version`, `to_version`,
-`patch_hash`, and `rollback`. Validation adds environment details, commands,
-exit codes, test counts, and logs. Verification adds baseline/candidate scan
-IDs and finding differences. A missing field or unsupported ecosystem should
-produce an explicit blocked or inconclusive status, not a guessed result.
+Person 3's simple Streamlit review view should display the exact diff, source
+finding, evidence challenge, confidence factors, build/tests, before/after scan,
+remaining risk, and rollback. Buttons record `approve`, `reject`, or
+`request_changes`; they do not apply the patch. Tie approval to `baseline_commit`
+and `patch_sha256`, and invalidate it if either changes. A typed reviewer name is
+only a declared identity in a demo; do not present it as authenticated approval
+without an actual identity system.
 
-Suggested states: `detected -> assessed -> proposed -> sandbox_eligible ->
-sandbox_running -> validated/inconclusive/failed -> rescanned -> awaiting_review
--> approved/rejected`. Save a timestamped event for each transition. Retries
-must be safe and must not reuse approval for a different patch.
+## Person 4: sandbox that can give a meaningful answer
 
-## Build order and handoffs
+1. Create a fresh workspace at the recorded baseline commit. Keep the original
+   repository read-only. Apply the proposal there and verify that only the
+   allowed files changed.
+2. Build and test both baseline and candidate in the **same pinned environment**.
+   Run the application's actual build and tests, then record exit codes and logs.
+   `npm audit` measures advisory findings and `npm ls` traces dependencies; neither
+   substitutes for application tests.
+3. Use an unprivileged, disposable container or equivalent isolation; do not
+   pass host secrets or mount the Docker socket inside the target. Bound time,
+   CPU, memory, disk, and network access. Record any network access needed to
+   fetch dependencies and every command that was executed.
+4. If baseline tests fail, choose a controlled test environment or a different
+   demo target with runnable tests. Do not label a candidate as regression-free
+   when the baseline could not be tested. A missing test suite, failed build, or
+   timeout is `failed` or `inconclusive`, never `passed`.
 
-1. **All five:** agree on schemas, stable finding keys, status names, and one demo
-   repository/commit with runnable baseline tests.
-2. **People 1 and 3:** produce grounded risk and non-CVE investigation records.
-   **Person 2:** produce one small, verifiable candidate using a real advisory.
-3. **Person 4:** run the candidate in a disposable sandbox and return build/test
-   evidence. No source branch or target checkout is modified.
-4. **Person 5:** rescan the candidate and generate the before/after report.
-5. **Person 3 and a human reviewer:** examine the exact patch and evidence,
-   record approval or rejection, and invalidate it if the patch changes.
-6. Integrate the stages through the orchestrator only after each artifact can be
-   produced and read independently. Keep the Day 1 scan usable when a Day 2
-   stage is unavailable.
+Do not commit to a new demo repository just because its name sounds easier.
+Select it only after a trial confirms a stable commit, reproducible install,
+baseline build and tests, a small real fix candidate, and a reasonable scan time.
+This is the first practical check before the five agents start in parallel.
 
-## Day 2 demonstration and definition of done
+## Person 5: rescan, compare, and tell the complete story
 
-Demonstrate one known vulnerability with a real candidate version and one
-non-CVE suspicious change. Show the baseline scan, contextual ranking, exact
-patch, sandbox build/test, after-scan, remaining or new risk, and a human
-decision. Also demonstrate a blocked case: no safe version, failed tests,
-missing scanner, or low-confidence proposal. It must remain visibly unapproved.
+Scan baseline and candidate with matching tools, scanner settings, and recorded
+database versions where possible. Compare SBOM packages, target finding keys,
+new dependencies, Grype/Trivy results, suspicious changes, and container/CI
+signals. Preserve both raw scanner records when they describe one underlying
+issue. If coverage differs, mark the comparison `inconclusive` for the affected
+category; never call an unscanned issue resolved.
 
-Day 2 is complete when reviewers can reproduce the evidence chain, see which
-stages ran, understand why a fix was proposed, and tell whether it actually
-reduced risk without breaking the tested application. If that cannot be shown,
-the report says `inconclusive` and names the missing evidence.
+The concise report should answer: what mattered, what changed, did it build and
+pass application tests, did the target finding disappear, did new high risks
+appear, what remains, and who approved or rejected the exact proposal? Keep full
+evidence in JSON and logs. `resolved` requires a comparable after-scan;
+`verified` additionally requires the required build/test gates to pass. Present
+an honest `inconclusive` when any required evidence is missing.
+
+## Integration order and definition of done
+
+1. **Together:** choose and trial one reproducible demo target and freeze the
+   artifact schemas, status enums, stable finding key, and one success fixture.
+2. **People 1–3:** produce risk, investigation, fix proposal, and the bounded
+   evidence challenge. Review a real transitive dependency case and a no-fix case.
+3. **Person 4:** implement the isolated baseline/candidate build and test runner.
+   Hand Person 5 a complete validation record, including failures.
+4. **Person 5:** rescan, compare, and produce the concise report. Person 3 wires
+   the review decision to Person 5's display and artifact links.
+5. Integrate the stages. Demonstrate a successful candidate **and** a blocked
+   candidate. Keep the blocked one visibly unapproved.
+
+The demo succeeds when a reviewer can trace the original finding to its evidence,
+understand the risk and exact patch, reproduce the sandbox result, see a comparable
+before/after scan, and make an informed decision. Any missing proof appears as
+`inconclusive` with a reason, not as success.
