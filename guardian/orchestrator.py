@@ -1,8 +1,12 @@
-from guardian.agents import recon, sbom_graph, suspicious, vulnerability, container_ci, evidence_risk
+from guardian.agents import (
+    recon, sbom_graph, suspicious, vulnerability, container_ci, evidence_risk,
+    risk_assessment,
+)
 from guardian.agents.base import RunContext
 from guardian.report import generate as generate_report
 
-# Ordered Day 1 pipeline. Validation and automated remediation remain Day 2 work.
+# Ordered pipeline. Day 2 adds contextual risk ranking; validation and automated
+# remediation remain later Day 2 work.
 PIPELINE = [
     ("Recon Agent", recon.run),
     ("SBOM & Graph Agent", sbom_graph.run),
@@ -10,6 +14,7 @@ PIPELINE = [
     ("Suspicious Change Agent", suspicious.run),
     ("Container & CI Agent", container_ci.run),
     ("Evidence & Risk Agent", evidence_risk.run),
+    ("Risk Assessment Agent", risk_assessment.run),
 ]
 
 
