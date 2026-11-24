@@ -1,0 +1,12 @@
+{
+  "severity_verdict": {
+    "none": "allow_logged",
+    "low": "allow_logged",
+    "medium": "needs_review",
+    "high": "needs_review_blocking",
+    "critical": "needs_review_blocking"
+  },
+  "allowed_decisions": ["approve", "reject", "request_changes"],
+  "approved_reviewers": ["team-lead", "security-reviewer"],
+  "approval_expiry_hours": 24
+}
