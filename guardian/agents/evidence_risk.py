@@ -7,30 +7,26 @@ Responsibilities
 ----------------
 1. Read raw findings produced by earlier agents from ctx.state["findings"].
 2. Validate every finding: required fields, ID format, evidence dict non-empty.
-3. Assign a transparent risk_level based on severity + evidence quality.
+3. Assign a transparent severity-based risk_level.
 4. Enrich findings with concise remediation recommendations.
-5. Optionally call Groq (llama-3.3-70b-versatile) to explain findings in plain
-   language (never to invent CVEs, versions, or new evidence).
+5. Optionally request structured AI review priority and suspicious hypotheses.
 6. Save processed output via ctx.save().
 
 Design rules (hallucination prevention)
 ----------------------------------------
-- AI is NEVER the source of risk decisions; it only produces human-readable prose.
-- All risk levels are computed deterministically before the AI call.
-- AI output is checked for new CVE IDs; other claims require human review.
+- Scanner risk levels remain deterministic; AI may suggest review order only.
+- AI output is checked against known IDs, versions, and evidence references.
 - If the API key is absent or the call fails, the deterministic fallback is used.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import textwrap
 from typing import Any
 
 from guardian.agents.base import RunContext
-from guardian.secrets import groq_key, groq_model
+from guardian.ai_review import review as ai_review
+from guardian.secrets import groq_key
 
 AGENT = "Evidence & Risk Agent"
 
@@ -56,6 +52,7 @@ _SEVERITY_BASE: dict[str, str] = {
 _QUALITY_BOOST = {"nvd", "osv", "github_advisory", "snyk", "grype", "trivy", "static inspection"}
 _QUALITY_LABEL = {True: "named scanner or static check", False: "unidentified source"}
 _RISK_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unrated": 4}
+MAX_AI_RISK_REVIEWS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -154,69 +151,6 @@ def _get_remediation(finding_type: str, fix_hint: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Optional Groq AI explanation  (prose only, never source of risk data)
-# ---------------------------------------------------------------------------
-
-def _build_ai_prompt(finding: dict) -> str:
-    evidence = finding.get("evidence") or {}
-    safe_evidence = {
-        key: evidence[key] for key in (
-            "tool", "vulnerability_id", "cve_ids", "severity", "purl",
-            "fixed_versions", "file", "line"
-        ) if key in evidence
-    }
-    safe_finding = {
-        key: finding.get(key) for key in ("id", "type", "title", "component", "severity", "risk_level")
-    }
-    safe_finding["evidence"] = safe_evidence
-    return textwrap.dedent(f"""
-        You are a software supply-chain security analyst.
-        Provide a concise, plain-language explanation (2–4 sentences) of the
-        following security finding for a developer audience.
-
-        STRICT RULES:
-        - Do NOT invent or modify CVE IDs, version numbers, or package names.
-        - Do NOT introduce new evidence or change the risk level.
-        - Explain only what the evidence already shows.
-        - Return plain text, no markdown.
-
-        Finding JSON:
-        {json.dumps(safe_finding, indent=2, default=str)}
-    """).strip()
-
-
-def _ai_explanation(finding: dict) -> str | None:
-    """
-    Call Groq (llama-3.3-70b-versatile) for a plain-language explanation.
-    Returns None if the key is absent, the call fails, or output looks fabricated.
-    """
-    api_key = groq_key()
-    if not api_key:
-        return None
-
-    try:
-        from groq import Groq  # optional dependency
-        client = Groq(api_key=api_key, timeout=15.0, max_retries=0)
-        response = client.chat.completions.create(
-            model=groq_model(),
-            max_completion_tokens=256,
-            messages=[{"role": "user", "content": _build_ai_prompt(finding)}],
-        )
-        text = response.choices[0].message.content.strip()
-
-        # Hallucination guard: reject if AI introduces new CVE IDs
-        original_cves = set(re.findall(r"CVE-\d{4}-\d+", json.dumps(finding)))
-        output_cves   = set(re.findall(r"CVE-\d{4}-\d+", text))
-        new_cves = output_cves - original_cves
-        if new_cves:
-            return None  # silently discard fabricated references
-
-        return text
-    except Exception:  # noqa: BLE001
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Main agent entry point
 # ---------------------------------------------------------------------------
 
@@ -295,9 +229,12 @@ def run(ctx: RunContext) -> None:  # noqa: C901
             f["dependency_path"] = []
 
         # -----------------------------------------------------------------
-        # Optional AI prose explanation
+        # Advisory review order is kept separate from scanner risk.
         # -----------------------------------------------------------------
-        f["ai_explanation"] = None
+        f["review_priority"] = risk_level
+        suspicious_review = ctx.state.get("ai_suspicious", {}).get(f["id"])
+        if suspicious_review:
+            f["ai_suspicious"] = suspicious_review
 
         # -----------------------------------------------------------------
         # Tracking metadata
@@ -309,10 +246,35 @@ def run(ctx: RunContext) -> None:  # noqa: C901
         processed.append(f)
         ctx.note(AGENT, f"  [{f['id']}] {f['title'][:60]} -> risk={risk_level}")
 
-    for finding in sorted(processed, key=lambda item: (
+    ordered = sorted(processed, key=lambda item: (
         _RISK_ORDER.get(item["risk_level"], 99), item["id"]
-    ))[:5]:
-        finding["ai_explanation"] = _ai_explanation(finding)
+    ))
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    seen_types: set[str] = set()
+    for finding in ordered:
+        if finding["type"] not in seen_types and len(selected) < MAX_AI_RISK_REVIEWS:
+            selected.append(finding)
+            selected_ids.add(finding["id"])
+            seen_types.add(finding["type"])
+    for finding in ordered:
+        if len(selected) >= MAX_AI_RISK_REVIEWS:
+            break
+        if finding["id"] not in selected_ids:
+            selected.append(finding)
+            selected_ids.add(finding["id"])
+
+    risk_reviews = {}
+    for finding in selected:
+        assessment = ai_review("risk", finding)
+        finding["ai_assessment"] = assessment
+        risk_reviews[finding["id"]] = assessment
+        if assessment["status"] == "completed":
+            suggested = assessment["priority"]
+            if _RISK_ORDER[suggested] < _RISK_ORDER[finding["risk_level"]]:
+                finding["review_priority"] = suggested
+    ctx.state["ai_risk"] = risk_reviews
+    ctx.save("risk_ai.json", risk_reviews)
 
     # -------------------------------------------------------------------------
     # Update ctx.state so the report generator can read processed findings
@@ -326,6 +288,8 @@ def run(ctx: RunContext) -> None:  # noqa: C901
         "total_skipped": len(skipped),
         "risk_counts":   risk_counts,
         "ai_available": bool(groq_key()),
+        "ai_attempted": len(risk_reviews),
+        "ai_reviewed": sum(item["status"] == "completed" for item in risk_reviews.values()),
     }
 
     output = {

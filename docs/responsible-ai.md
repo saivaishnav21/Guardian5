@@ -5,13 +5,19 @@
   Groq suggestions are marked unverified.
 - The initial risk level follows the detector's severity. Exploitability,
   reachability, exposure, and provenance are not established by this prototype.
-- Groq can suggest ecosystems from filenames and explain up to five findings in
-  prose. Its text cannot create a finding or change the final risk level. New CVE
-  IDs in generated prose are rejected; other statements still need human review.
-- The recon call sends only repository-relative filenames. The explanation call
-  sends a limited finding summary and selected evidence fields, never raw source
-  lines or the API key. These are still external API requests; use no key when
+- Groq can suggest ecosystems from filenames, review up to six findings for
+  priority, and suggest hypotheses and next checks for up to five suspicious
+  findings. AI suggestions are labelled **🤖 AI Advisory — not verified**. They
+  cannot create findings or change scanner risk; a validated suggestion can only
+  raise a finding's review order.
+- The recon call sends only repository-relative filenames. Finding review calls
+  send a limited finding summary and selected evidence fields, never raw source
+  lines or the API key. Responses must cite supplied fields. New CVE IDs,
+  versions, and unsupported reachability claims are rejected, but other claims
+  still need human review. These are external API requests; use no key when
   scanning repositories whose metadata must stay local.
+- AI responses contain an empty `ai_negotiation_log` placeholder for Day 2;
+  no agent negotiation is performed in Day 1.
 - Store `GROQ_API_KEY` in the gitignored `.env` file or environment. Never commit
   keys, raw secrets, or generated run directories.
 - Only public GitHub repositories are accepted by the current recon agent. The

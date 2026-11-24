@@ -89,7 +89,7 @@ def _sorted_findings(findings: list[dict]) -> list[dict]:
     return sorted(
         findings,
         key=lambda f: (
-            _RISK_ORDER.get(f.get("risk_level", "unrated"), 99),
+            _RISK_ORDER.get(f.get("review_priority", f.get("risk_level", "unrated")), 99),
             f.get("id", ""),
         ),
     )
@@ -163,8 +163,8 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
             "---",
             f"## Priority Findings (top {min(len(findings), _OVERVIEW_LIMIT)} of {len(findings)})",
             "",
-            "| ID | Type | Component | Severity | Risk | Title |",
-            "|----|------|-----------|----------|------|-------|",
+            "| ID | Type | Component | Severity | Scanner risk | Review priority | Title |",
+            "|----|------|-----------|----------|--------------|-----------------|-------|",
         ]
         for f in ranked[:_OVERVIEW_LIMIT]:
             rid   = f.get("id", "?")
@@ -176,7 +176,8 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
             lines.append(
                 f"| {_cell(rid)} | {_cell(ftype)} | {_cell(comp)} | "
                 f"{_sev_emoji(sev)} {_cell(sev)} | "
-                f"{_risk_emoji(risk)} {_cell(risk)} | {_cell(title)} |"
+                f"{_risk_emoji(risk)} {_cell(risk)} | "
+                f"{_cell(f.get('review_priority', risk))} | {_cell(title)} |"
             )
         lines += ["", "All findings and full evidence are in [report.json](report.json).", ""]
 
@@ -254,6 +255,24 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
                     "",
                 ]
 
+            risk_ai = f.get("ai_assessment") or {}
+            suspicious_ai = f.get("ai_suspicious") or {}
+            if risk_ai.get("status") == "completed" or suspicious_ai.get("status") == "completed":
+                lines += ["**🤖 AI Advisory — not verified:**", ""]
+                if risk_ai.get("status") == "completed":
+                    lines += [
+                        f"- Suggested review priority: {_cell(risk_ai['priority'])}; {_cell(risk_ai['reason'])}",
+                        f"- Evidence references: {_cell(', '.join(risk_ai['evidence_refs']))}; "
+                        f"unknown: {_cell(', '.join(risk_ai['unknowns']) or 'none listed')}",
+                    ]
+                if suspicious_ai.get("status") == "completed":
+                    lines += [
+                        f"- Hypothesis: {_cell(suspicious_ai['hypothesis'])}",
+                        f"- Check next: {_cell(suspicious_ai['check_next'])}; "
+                        f"evidence references: {_cell(', '.join(suspicious_ai['evidence_refs']))}",
+                    ]
+                lines.append("")
+
             # Notes from other agents
             notes = f.get("notes", [])
             if notes:
@@ -269,10 +288,10 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
     lines += [
         "## Responsible AI Notice",
         "",
-        "Risk levels in this report are computed **deterministically** from",
-        "reported severity and evidence quality — not by an AI model.",
-        "AI drafts in report.json are advisory and do not change findings or risk levels.",
-        "New CVE IDs in those drafts are rejected; review all other claims manually.",
+        "Risk levels in this report follow reported severity **deterministically**.",
+        "Evidence source quality is noted in the rationale; AI does not set scanner risk.",
+        "AI assessments are unverified advice. They may raise review order but never change scanner risk.",
+        "New CVE IDs and versions are rejected; review all other claims manually.",
         "",
         "---",
         "*Guardian AI · Software Supply Chain Guardian · Hackathon Day 1*",
@@ -325,9 +344,9 @@ def _build_json(ctx: RunContext, findings: list[dict], summary: dict) -> dict:
         "skipped_findings": ctx.state.get("skipped_findings", []),
         "responsible_ai": {
             "risk_assignment": "deterministic",
-            "ai_role":         "prose explanation only",
+            "ai_role":         "unverified risk and suspicious-change advisory",
             "hallucination_guards": [
-                "AI prose checked for new CVE IDs; other claims need human review",
+                "AI output checked for new CVE IDs, versions, and evidence references",
                 "AI never modifies risk_level or evidence fields",
                 "Deterministic fallback when API key absent",
             ],
@@ -375,7 +394,8 @@ def generate(ctx: RunContext) -> tuple[Path, Path]:
         "total_skipped":         er_summary.get("total_skipped", 0),
         "risk_counts":           risk_counts,
         "type_counts":           type_counts,
-        "ai_explanations_used":  sum(1 for f in findings if f.get("ai_explanation")),
+        "ai_risk_reviews_used": sum(f.get("ai_assessment", {}).get("status") == "completed" for f in findings),
+        "ai_suspicious_reviews_used": sum(f.get("ai_suspicious", {}).get("status") == "completed" for f in findings),
     }
 
     md_text   = _build_markdown(ctx, findings, summary)

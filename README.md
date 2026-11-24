@@ -69,7 +69,7 @@ Remove-Item Env:\GUARDIAN_IMAGE_REF
 
 ### Optional Groq assistance
 
-Copy `.env.example` to the gitignored `.env` file and set `GROQ_API_KEY` there. Without a key, deterministic scanning continues. Recon can send up to 200 repository-relative **filenames** to Groq for unverified manifest suggestions; the suggestions do not add dependencies to the SBOM. The evidence stage can generate drafts for up to five high-priority findings. AI text cannot create a finding or set its risk level. Review all claims in AI prose against recorded evidence before using them.
+Copy `.env.example` to the gitignored `.env` file and set `GROQ_API_KEY` there. No additional key is needed. Without a key, deterministic scanning continues. Recon can send up to 200 repository-relative **filenames** to Groq for unverified manifest suggestions; the suggestions do not add dependencies to the SBOM. Groq also reviews up to six findings for suggested priority and up to five suspicious findings for a hypothesis and next check. These are marked **🤖 AI Advisory — not verified** in the dashboard and report. AI cannot create findings or change scanner risk; validated suggestions can only raise review order. The JSON report includes an empty `ai_negotiation_log` placeholder for future Day 2 negotiation. Review all AI claims against recorded evidence before acting.
 
 ## Verification and current limits
 
