@@ -1,25 +1,18 @@
 """Optional filename-only suggestions for manifests unknown to deterministic recon."""
 
 import json
-import os
 import re
-from pathlib import Path
+from guardian.secrets import groq_key, groq_model
 
-DEFAULT_MODEL = "openai/gpt-oss-20b"
 ECOSYSTEM_RE = re.compile(r"^[a-z][a-z0-9_+.-]{0,39}$")
 MAX_SUGGESTIONS = 20
 
 
 def suggest_manifests(paths: list[str]) -> dict:
     """Suggest, but do not verify, package manifests from repository-relative paths."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
-    except ImportError:
-        pass
-    model = os.getenv("GROQ_MODEL") or DEFAULT_MODEL
+    model = groq_model()
     result = {"status": "skipped_no_key", "model": model, "suggestions": []}
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = groq_key()
     if not api_key:
         return result
     if not paths:

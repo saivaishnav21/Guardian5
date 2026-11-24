@@ -8,6 +8,7 @@ from typing import Mapping
 
 from guardian.agents.base import RunContext
 from guardian.schemas import Finding
+from guardian.secrets import scanner_env
 
 try:
     from rapidfuzz.fuzz import WRatio
@@ -124,6 +125,7 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         check=False,
+        env=scanner_env(),
     )
 
 
@@ -446,7 +448,7 @@ def run(ctx: RunContext) -> None:
                     ),
                     "similar_to": match["target"],
                     "confidence": match["score"],
-                    "branch": tampered_branch,
+                    "branch": base,
                 },
             ))
 
@@ -466,7 +468,7 @@ def run(ctx: RunContext) -> None:
                         "Install lifecycle scripts can execute code during setup"
                     ),
                     "scripts": found_scripts,
-                    "branch": tampered_branch,
+                    "branch": base,
                 },
             ))
 
@@ -501,7 +503,7 @@ def run(ctx: RunContext) -> None:
                         "The dependency is not resolved by normal registry metadata"
                     ),
                     "resolutions": outside_registry,
-                    "branch": tampered_branch,
+                    "branch": base,
                 },
             ))
 
@@ -525,7 +527,7 @@ def run(ctx: RunContext) -> None:
                         "is declared"
                     ),
                     "scripts": lifecycle,
-                    "branch": tampered_branch,
+                    "branch": base,
                 },
             ))
 
@@ -631,12 +633,12 @@ def run(ctx: RunContext) -> None:
                         },
                     ))
 
-    findings = enrich_findings_with_groq(findings)
-
     for finding in findings:
         ctx.add_finding(finding)
 
     ctx.state["suspicious"] = {
+        "status": "completed_static",
+        "branch_comparison": "completed" if branch_available else "not_available",
         "finding_count": len(findings),
         "tampered_branch": tampered_branch,
     }

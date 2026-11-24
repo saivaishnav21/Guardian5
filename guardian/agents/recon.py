@@ -4,6 +4,7 @@ import subprocess
 
 from guardian.agents.base import RunContext
 from guardian.agents.groq_recon import suggest_manifests
+from guardian.secrets import scanner_env
 
 AGENT = "Recon Agent"
 
@@ -33,10 +34,11 @@ def run(ctx: RunContext) -> None:
 
     dest = ctx.run_dir / "target"
     ctx.note(AGENT, f"cloning {url} (shallow)")
-    subprocess.run(["git", "clone", "--depth", "1", url, str(dest)], check=True)
+    subprocess.run(["git", "clone", "--depth", "1", url, str(dest)], check=True,
+                   env=scanner_env())
     commit = subprocess.run(
         ["git", "-C", str(dest), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=scanner_env(),
     ).stdout.strip()
 
     found = {"manifests": [], "dockerfiles": [], "compose_files": [], "ci_workflows": []}
@@ -72,7 +74,7 @@ def run(ctx: RunContext) -> None:
             raise RuntimeError("npm not found. Install Node.js and npm first.")
         ctx.note(AGENT, "no lockfile found, generating one (lockfile-only, scripts disabled)")
         subprocess.run([npm, "install", "--package-lock-only", "--ignore-scripts"],
-                       cwd=dest, check=True)
+                       cwd=dest, check=True, env=scanner_env())
         actions.append("generated package-lock.json via npm --package-lock-only --ignore-scripts")
 
     unknown_candidates.sort(key=lambda path: (path.count("/"), path))

@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 from pathlib import Path
+from guardian.secrets import scanner_env
 
 
 def generate_sbom(target_dir: str, out_path: str) -> str:
@@ -11,5 +12,5 @@ def generate_sbom(target_dir: str, out_path: str) -> str:
         raise RuntimeError("cdxgen not found. Install it with npm install -g @cdxgen/cdxgen.")
     cmd = [cdxgen, "-o", str(out_path), str(target_dir)]
     print("  running:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=scanner_env())
     return str(out_path)
