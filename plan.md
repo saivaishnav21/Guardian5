@@ -170,6 +170,28 @@ present that decision as authenticated approval without an identity system.
 
 ## Person 4: sandbox that can give a meaningful answer
 
+**First trial:** select one `upgrade` proposal by finding ID, not the entire
+finding queue. A score at or above the configured threshold skips only the
+preflight human decision; `may_auto_trial()` must still confirm the proposal,
+report, and any human rejection. A lower-scoring upgrade needs a recorded
+preflight approval checked by `may_trial()`. `manual_review` and
+`mitigation_only` are not executable patches.
+
+The trial runner should accept a run directory, finding ID, and locally
+available runtime image. Archive the recorded commit into separate baseline
+and candidate copies under that run. Generate the candidate change from
+validated package and version fields; never execute free-form proposal text.
+Record the exact diff and its SHA-256, and stop if files beyond the declared
+manifest and lockfile changed. The source checkout must remain untouched.
+
+Use the same image and commands for both copies. Install dependencies with
+lifecycle scripts disabled in bounded containers; turn networking off for
+build and application tests. Save command, exit code, duration, and logs for
+each step in `validation.json`. A failed baseline or missing test suite is
+`inconclusive`; a candidate regression is `failed`; only matching successful
+build/tests can be `passed`. A passed validation is **not** a verified fix:
+Person 5 still needs a comparable rescan and a final human decision.
+
 1. Create a fresh workspace at the recorded baseline commit. Keep the original
    repository read-only. Apply the proposal there and verify that only the
    allowed files changed.
