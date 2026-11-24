@@ -1,4 +1,5 @@
 runs/
+/proposals.json
 .venv/
 __pycache__/
 *.pyc

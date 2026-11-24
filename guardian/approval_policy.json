@@ -8,5 +8,6 @@
   },
   "allowed_decisions": ["approve", "reject", "request_changes"],
   "approved_reviewers": ["team-lead", "security-reviewer"],
-  "approval_expiry_hours": 24
+  "approval_expiry_hours": 24,
+  "auto_sandbox_trial_threshold": 70
 }

@@ -21,6 +21,15 @@ def print_summary(ctx):
             f"({vulnerability.get('finding_count', 0)} findings)"
         )
 
+    risk = ctx.state.get("risk_assessment", {})
+    proposals = ctx.state.get("remediation", {})
+    if risk:
+        print(f"Prioritized risks: {risk.get('summary', {}).get('ranked_items', 0)} "
+              f"({risk.get('path', 'not available')})")
+    if proposals:
+        print(f"Remediation proposals: {proposals.get('count', 0)} "
+              f"{proposals.get('by_result', {})} ({proposals.get('path', 'not available')})")
+
     print("\nTop findings:")
     shown = 0
     for finding in findings:

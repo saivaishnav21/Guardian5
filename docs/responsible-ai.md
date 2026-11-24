@@ -18,6 +18,10 @@
   scanning repositories whose metadata must stay local.
 - AI responses contain an empty `ai_negotiation_log` placeholder for Day 2;
   no agent negotiation is performed in Day 1.
+- Day 2 contextual risk scores are deterministic. Existing AI priority advice is
+  attached separately where available and cannot change the score. The proposal
+  stage may request explanations for at most three bounded direct-npm upgrades;
+  these are unverified text and cannot authorize a sandbox trial or adoption.
 - Store `GROQ_API_KEY` in the gitignored `.env` file or environment. Never commit
   keys, raw secrets, or generated run directories.
 - Only public GitHub repositories are accepted by the current recon agent. The

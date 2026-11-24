@@ -25,6 +25,10 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from guardian.approval_gate import (
+    create_preflight_review, load_proposals, may_auto_trial, may_trial, proposal_sha256,
+    save_preflight_review, trial_route,
+)
 from guardian.secrets import groq_key
 
 import streamlit as st
@@ -663,10 +667,7 @@ def _select_repo(repo_url: str) -> None:
 def _sidebar() -> str | None:
     """Render sidebar. Returns repo URL to scan or None."""
     with st.sidebar:
-        st.image(
-            "https://img.icons8.com/color/96/shield.png",
-            width=64,
-        )
+        st.markdown("# 🛡️")
         st.title("Guardian AI")
         st.caption("Software Supply Chain Guardian")
         st.divider()
@@ -684,15 +685,46 @@ def _sidebar() -> str | None:
                       on_click=_select_repo, args=(sample,))
 
         if groq_key():
-            st.success("🤖 AI advisory: **enabled**")
+            st.success("🤖 AI key configured")
         else:
-            st.info("🤖 AI advisory: **disabled**\n\nSet `GROQ_API_KEY` env var to enable.")
+            st.info("🤖 AI advisory unavailable. Evidence based ranking and proposals still run.")
 
         st.divider()
-        st.caption("Day 1 prototype")
+        st.caption("Scan → prioritize → propose → review")
+
+        runs_root = Path(__file__).resolve().parents[1] / "runs"
+        saved_runs = sorted((p for p in runs_root.glob("*/state.json") if p.is_file()),
+                            key=lambda p: p.parent.name, reverse=True)
+        if saved_runs:
+            selected = st.selectbox("Open a saved scan", [None, *saved_runs],
+                                    format_func=lambda p: "Choose a run" if p is None else p.parent.name)
+            if st.button("Open saved scan", disabled=selected is None, use_container_width=True):
+                _open_saved_run(selected)
 
         scan_clicked = st.button("🚀 Run Scan", type="primary", use_container_width=True)
         return repo_url.strip() if scan_clicked else None
+
+
+def _open_saved_run(state_path: Path) -> None:
+    """Restore only a completed local run; do not scan or change its baseline."""
+    from guardian.agents.base import RunContext
+
+    try:
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        state = saved["state"]
+        repo_url = state["recon"]["repo_url"]
+        report_path = state_path.parent / "report.json"
+        if not report_path.is_file():
+            raise ValueError("this run has no completed report")
+        ctx = RunContext(repo_url=repo_url, run_dir=state_path.parent,
+                         state=state, log=saved.get("log", []))
+        st.session_state.ctx = ctx
+        st.session_state.md_path = str(state_path.parent / "report.md")
+        st.session_state.json_path = str(report_path)
+        st.session_state.run_error = None
+        st.session_state.last_repo = repo_url
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        st.session_state.run_error = {"message": f"Could not open saved run: {exc}", "traceback": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -899,11 +931,234 @@ def _render_downloads(ctx, md_path: str | None, json_path: str | None) -> None:
                 use_container_width=True,
             )
 
+    for filename, label in (
+        ("risk_assessment.json", "Download risk assessment"),
+        ("proposals.json", "Download proposals"),
+        ("approval.json", "Download latest review"),
+    ):
+        path = ctx.run_dir / filename
+        if path.is_file():
+            st.download_button(label, data=path.read_bytes(), file_name=filename,
+                               mime="application/json", key=f"download_{filename}")
+
 
 def _render_logs(ctx) -> None:
     with st.expander("🗒️ Agent Log"):
         for entry in ctx.log:
             st.markdown(f"**[{entry['agent']}]** {entry['message']}")
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not read {path.name}: {exc}")
+        return None
+
+
+def _select_item(items: list[dict], label: str, key: str) -> dict | None:
+    if not items:
+        st.info("No items are available for this run.")
+        return None
+    index = st.selectbox(
+        label, range(len(items)), key=key,
+        format_func=lambda i: (
+            f"#{items[i].get('rank', i + 1)} · "
+            f"{items[i].get('finding_id', (items[i].get('finding_ids') or ['?'])[0])} · "
+            f"{items[i].get('component', '?')}"
+        ),
+    )
+    return items[index]
+
+
+def render_risks(run_dir: Path) -> None:
+    st.subheader("Prioritized risks")
+    st.caption("Evidence based ranking for this repository and commit. AI advice is separate from the score.")
+    path = run_dir / "risk_assessment.json"
+    if not path.is_file():
+        st.info("Risk assessment has not been generated for this run.")
+        return
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        st.error("Risk assessment items are invalid.")
+        return
+    counts = (data.get("summary") or {}).get("by_level") or {}
+    cols = st.columns(4)
+    for col, level in zip(cols, ("critical", "high", "medium", "low")):
+        col.metric(level.title(), counts.get(level, 0))
+    st.dataframe([{
+        "Rank": item.get("rank"), "Score": item.get("risk_score"),
+        "Level": item.get("risk_level"), "Component": item.get("component"),
+        "Finding": item.get("title"),
+    } for item in items], hide_index=True, width="stretch")
+    item = _select_item(items, "Inspect ranked risk", "risk_detail_choice")
+    if item:
+        st.write(item.get("rationale") or "No scoring rationale recorded.")
+        st.caption("Evidence: " + ", ".join(item.get("evidence_refs") or []))
+        if item.get("unknowns"):
+            st.warning("Unknowns: " + "; ".join(item["unknowns"]))
+        advisory = item.get("ai_advisory")
+        if advisory:
+            st.info("🤖 AI Advisory — not verified")
+            st.write(advisory.get("reason") or advisory.get("hypothesis") or "No explanation recorded.")
+        with st.expander("Scoring details"):
+            st.json(item.get("score_breakdown") or [])
+
+
+def _proposal_detail(proposal: dict) -> None:
+    result = proposal.get("result", "unknown")
+    st.markdown(f"**{proposal.get('component', '?')} · {result.replace('_', ' ').title()}**")
+    cols = st.columns(3)
+    cols[0].metric("Risk score", proposal.get("risk_score", "—"))
+    cols[1].metric("Proposed version", proposal.get("target_version") or "None recorded")
+    cols[2].metric("Proposal confidence", f"{proposal.get('confidence_score', 0)}/100")
+    st.caption("Proposal confidence reflects recorded evidence, not compatibility or permission to apply a change.")
+    route = trial_route(proposal)
+    st.caption(f"Sandbox routing threshold: {route['threshold']}/100 · "
+               f"{'Automatic trial candidate' if route['route'] == 'auto_sandbox_trial' else 'Human review required'}")
+    if proposal.get("reason"):
+        st.warning(proposal["reason"])
+    if proposal.get("manifest_file"):
+        st.write(f"**Manifest:** `{proposal['manifest_file']}`")
+    if proposal.get("command"):
+        st.caption("Candidate command for a future sandbox trial. This screen never runs it.")
+        st.code(proposal["command"], language="bash")
+    if proposal.get("compatibility_concern"):
+        st.caption(proposal["compatibility_concern"])
+    if proposal.get("llm_explanation_status") == "completed_unverified":
+        st.info("🤖 AI Advisory — not verified")
+        st.write(proposal.get("llm_explanation", ""))
+    with st.expander("Evidence, limits, and rollback"):
+        st.write("**Evidence:** " + (", ".join(proposal.get("evidence_refs") or []) or "None recorded"))
+        st.write("**Unknowns:** " + ("; ".join(proposal.get("unknowns") or []) or "None recorded"))
+        st.write("**Rollback:** " + str(proposal.get("rollback") or "No change has been applied"))
+        st.write("**Confidence factors:** " + "; ".join(proposal.get("confidence_reasons") or []))
+
+
+def _load_proposals(run_dir: Path) -> tuple[Path, list[dict]] | None:
+    source = run_dir / "proposals.json"
+    if not source.is_file():
+        st.info("Proposals have not been generated for this run.")
+        return None
+    try:
+        return source, load_proposals(source)
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not read proposals.json: {exc}")
+        return None
+
+
+def render_proposals(run_dir: Path) -> None:
+    st.subheader("Proposed fixes")
+    st.caption("A proposal is a candidate action. Build, tests, and rescan have not yet verified it.")
+    loaded = _load_proposals(run_dir)
+    if loaded is None:
+        return
+    _, proposals = loaded
+    cols = st.columns(4)
+    for col, result, label in zip(cols[:3],
+                                  ("upgrade", "manual_review", "mitigation_only"),
+                                  ("Upgrade candidates", "Manual review", "Mitigation only")):
+        col.metric(label, sum(p.get("result") == result for p in proposals))
+    cols[3].metric("Automatic sandbox route", sum(trial_route(p)["route"] == "auto_sandbox_trial"
+                                                   for p in proposals))
+    filter_result = st.selectbox("Show", ["all", "upgrade", "manual_review", "mitigation_only"],
+                                 format_func=lambda x: x.replace("_", " ").title())
+    shown = [p for p in proposals if filter_result == "all" or p.get("result") == filter_result]
+    st.dataframe([{
+        "Finding": p.get("finding_id"), "Component": p.get("component"),
+        "Risk": p.get("risk_level"), "Action": p.get("result"),
+        "Target": p.get("target_version") or "—",
+        "Trial route": trial_route(p)["route"].replace("_", " "),
+    } for p in shown], hide_index=True, width="stretch")
+    proposal = _select_item(shown, "Inspect proposal", "proposal_detail_choice")
+    if proposal:
+        _proposal_detail(proposal)
+
+
+def render_approval(run_dir: Path) -> None:
+    st.subheader("Human review")
+    st.caption("Review the current run's proposal. Approval permits a sandbox trial only; it does not apply or adopt a fix.")
+    loaded = _load_proposals(run_dir)
+    report_path = run_dir / "report.json"
+    if loaded is None or not report_path.is_file():
+        st.info("A completed report and proposals are required before review.")
+        return
+    source, proposals = loaded
+    report = _read_json(report_path)
+    if not isinstance(report, dict):
+        return
+    routes = ["auto_sandbox_trial", "manual_review", "all"]
+    if not any(trial_route(p)["route"] == "auto_sandbox_trial" for p in proposals):
+        routes = ["manual_review", "all"]
+    review_filter = st.selectbox("Review queue", routes,
+                                 format_func=lambda value: value.replace("_", " ").title())
+    review_items = [p for p in proposals if review_filter == "all"
+                    or trial_route(p)["route"] == review_filter]
+    proposal = _select_item(review_items, "Proposal to review", "approval_proposal_choice")
+    if proposal is None:
+        return
+    _proposal_detail(proposal)
+    header = report.get("guardian_report") or {}
+    st.caption(f"Baseline: {header.get('repo_url', '?')} · {header.get('commit', '?')}")
+
+    route = trial_route(proposal)
+    auto_ready = False
+    if route["route"] == "auto_sandbox_trial":
+        blocks = may_auto_trial(proposal, report, source)
+        if blocks:
+            st.warning("Automatic sandbox trial blocked: " + "; ".join(blocks))
+        else:
+            auto_ready = True
+            st.success("Automatically eligible for a disposable sandbox trial. No human preflight approval is needed.")
+            st.caption("This is not approval to apply or adopt the fix. Tests, rescan, and a final human decision are still required.")
+    else:
+        st.info(f"Human preflight review required. {route['reason']}")
+
+    history_path = run_dir / "approvals.json"
+    if history_path.is_file():
+        history = _read_json(history_path)
+        if isinstance(history, list):
+            previous = next((r for r in reversed(history) if isinstance(r, dict)
+                             and r.get("proposal_sha256") == proposal_sha256(proposal)), None)
+            if previous:
+                st.info(f"Latest decision: {previous.get('decision', 'unknown')} · {previous.get('reviewed_at', '?')}")
+                if previous.get("decision") == "approve":
+                    blocks = may_trial(previous, proposal, report, source)
+                    st.caption("Sandbox gate: permitted" if not blocks else "Sandbox gate: blocked — " + "; ".join(blocks))
+
+    st.warning("No patch or test result is attached. Final adoption is unavailable.")
+    if auto_ready:
+        st.caption("Optional human override: reject this candidate or request changes before a trial.")
+    decisions = ["request_changes", "reject"]
+    if proposal.get("result") == "upgrade" and not auto_ready:
+        decisions.append("approve")
+    with st.form("human_approval_form"):
+        decision = st.selectbox("Decision", decisions,
+                                format_func=lambda value: "Approve sandbox trial" if value == "approve"
+                                else value.replace("_", " ").title())
+        reason = st.text_area("Reason for decision", placeholder="State what you checked and what should happen next")
+        understood = st.checkbox("I reviewed this proposal and understand no fix is applied here")
+        submitted = st.form_submit_button("Record decision", type="primary")
+    if submitted:
+        if not understood:
+            st.error("Confirm the review scope before recording a decision.")
+            return
+        try:
+            review = create_preflight_review(
+                proposal=proposal, report=report, source_file=source,
+                decision=decision, reason=reason,
+            )
+            saved = save_preflight_review(review, run_dir)
+        except (OSError, ValueError) as exc:
+            st.error(f"Review was not recorded: {exc}")
+        else:
+            st.success(f"Decision recorded in {saved}")
+            if decision == "approve":
+                blocks = may_trial(review, proposal, report, source)
+                st.info("Sandbox gate: permitted" if not blocks else "Sandbox gate: blocked — " + "; ".join(blocks))
 
 
 # ---------------------------------------------------------------------------
@@ -913,81 +1168,62 @@ def _render_logs(ctx) -> None:
 def main() -> None:
     _init_state()
 
-    # Header
     st.markdown(
         """
         <div class="guardian-header">
             <h1>🛡️ Guardian AI</h1>
-            <p>Agentic Software Supply Chain Security Scanner</p>
+            <p>From repository evidence to a reviewable security decision</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Sidebar
     repo_to_scan = _sidebar()
-
-    # Trigger scan
     if repo_to_scan:
-        with st.spinner(f"Running Guardian AI pipeline on `{repo_to_scan}` …"):
+        with st.spinner(f"Scanning {repo_to_scan} …"):
             _run_pipeline(repo_to_scan)
-        if st.session_state.run_error:
-            err = st.session_state.run_error
-            st.error(f"❌ Pipeline failed: {err['message']}")
-            with st.expander("Show full traceback"):
-                st.code(err["traceback"], language="python")
-        else:
-            st.success("✅ Scan complete!")
+        if st.session_state.run_error is None:
+            st.success("Scan complete. Review the ranked risks and proposals below.")
 
-    # Display results
+    if st.session_state.run_error:
+        err = st.session_state.run_error
+        st.error(f"Pipeline failed: {err['message']}")
+        if err.get("traceback"):
+            with st.expander("Technical details"):
+                st.code(err["traceback"], language="python")
+
     ctx = st.session_state.ctx
     if ctx is not None and st.session_state.run_error is None:
-        tabs = st.tabs(["📊 Summary", "🔎 Findings", "🕸️ Graph", "📥 Downloads", "🗒️ Logs"])
+        st.caption(f"**Repository:** {ctx.repo_url}  ·  **Commit:** {ctx.state.get('recon', {}).get('commit', '?')}  ·  **Run:** {ctx.run_dir.name}")
+        tabs = st.tabs(["Overview", "Prioritized risks", "Proposed fixes", "Human review", "Evidence & downloads"])
         with tabs[0]:
             _render_summary(ctx)
+            remediation = ctx.state.get("remediation") or {}
+            st.info(f"{(ctx.state.get('risk_assessment') or {}).get('summary', {}).get('ranked_items', 0)} risks ranked · "
+                    f"{remediation.get('count', 0)} proposals generated · sandbox validation pending")
         with tabs[1]:
-            _render_findings(ctx)
+            render_risks(ctx.run_dir)
         with tabs[2]:
-            _render_graph(ctx)
+            render_proposals(ctx.run_dir)
         with tabs[3]:
-            _render_downloads(ctx, st.session_state.md_path, st.session_state.json_path)
+            render_approval(ctx.run_dir)
         with tabs[4]:
+            _render_findings(ctx)
+            _render_graph(ctx)
+            _render_downloads(ctx, st.session_state.md_path, st.session_state.json_path)
             _render_logs(ctx)
     elif ctx is None and st.session_state.run_error is None:
-        # Welcome / instructions
-        st.info(
-            "👈 Enter a public GitHub URL in the sidebar and click **Run Scan** to start."
-        )
-        st.markdown(
-            """
-### How it works
-
-1. **Recon Agent** – clones the repo and identifies ecosystems, Dockerfiles, CI workflows.
-2. **SBOM & Graph Agent** – generates a CycloneDX SBOM and builds a dependency graph.
-3. **Vulnerability Agent** – matches SBOM components with Grype and traces dependency paths.
-4. **Suspicious Investigation Agent** – checks npm package metadata and lockfile changes.
-5. **Container & CI Agent** – inspects Docker, Compose, and GitHub workflow files.
-6. **Evidence & Risk Agent** – validates findings and assigns initial risk levels.
-7. **Report Generator** – produces Markdown and JSON reports.
-
-### Responsible AI
-
-- Risk levels are computed **deterministically** — never by an AI model.
-- Optional Groq calls suggest unknown manifests, review risk priority, and suggest checks for suspicious changes.
-- **🤖 AI Advisory — not verified** is separate from scanner facts. AI may raise review order but cannot change scanner risk.
-- New CVE IDs, versions, and unsupported evidence references are rejected; other claims still need human review.
-- API keys are **never** logged, displayed, or stored in reports.
-
-### Prerequisites
-
-```bash
-./.venv/Scripts/python.exe -m pip install -r requirements.txt
-# cdxgen must be installed and available on PATH
-cdxgen --version
-grype version
-```
-            """
-        )
+        st.subheader("Start with a repository")
+        st.write("Enter any public GitHub repository URL in the sidebar and run a scan, or open a saved scan.")
+        cols = st.columns(4)
+        for col, title, body in zip(cols,
+                                    ("1 · Scan", "2 · Prioritize", "3 · Propose", "4 · Review"),
+                                    ("Collect dependency and security evidence.",
+                                     "Rank findings with an explainable score.",
+                                     "Prepare candidate fixes and manual cases.",
+                                     "Record a human decision for a sandbox trial.")):
+            col.markdown(f"**{title}**\n\n{body}")
+        st.caption("🤖 AI Advisory — not verified. Model output is separate from scanner evidence and never approves a fix.")
 
 
 if __name__ == "__main__":

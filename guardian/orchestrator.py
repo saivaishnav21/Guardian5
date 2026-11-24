@@ -1,8 +1,11 @@
-from guardian.agents import recon, sbom_graph, suspicious, vulnerability, container_ci, evidence_risk
+from guardian.agents import (
+    recon, sbom_graph, suspicious, vulnerability, container_ci, evidence_risk,
+    risk_assessment, remediation,
+)
 from guardian.agents.base import RunContext
 from guardian.report import generate as generate_report
 
-# Ordered Day 1 pipeline. Validation and automated remediation remain Day 2 work.
+# Risk and proposal stages observe and recommend; they do not apply changes.
 PIPELINE = [
     ("Recon Agent", recon.run),
     ("SBOM & Graph Agent", sbom_graph.run),
@@ -10,6 +13,8 @@ PIPELINE = [
     ("Suspicious Investigation Agent", suspicious.run),
     ("Container & CI Agent", container_ci.run),
     ("Evidence & Risk Agent", evidence_risk.run),
+    ("Risk Assessment Agent", risk_assessment.run),
+    ("Remediation Proposal Agent", remediation.run),
 ]
 
 

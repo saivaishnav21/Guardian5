@@ -155,7 +155,17 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
         lines.append(f"- **{label}:** {status}")
     lines.append(f"- **Demo branch comparison:** {ctx.state.get('suspicious', {}).get('branch_comparison', 'not_run')}")
     lines.append(f"- **Local image scan:** {ctx.state.get('container_ci', {}).get('image_scan_status', 'not_run')}")
-    lines += ["- **Validation:** not performed in Day 1", ""]
+    lines += ["- **Sandbox validation:** not run", ""]
+
+    assessment = ctx.state.get("risk_assessment", {})
+    remediation = ctx.state.get("remediation", {})
+    if assessment or remediation:
+        lines += ["## Day 2 Handoff", ""]
+        if assessment:
+            lines.append(f"- **Prioritized risks:** {assessment.get('summary', {}).get('ranked_items', 0)} in [risk_assessment.json](risk_assessment.json)")
+        if remediation:
+            lines.append(f"- **Recommended actions:** {remediation.get('by_result', {})} in [proposals.json](proposals.json)")
+        lines += ["- **Human review:** proposal decisions are recorded separately; no fix has been applied.", ""]
 
     # ── Findings table ───────────────────────────────────────────────────────
     if findings:
@@ -330,7 +340,11 @@ def _build_json(ctx: RunContext, findings: list[dict], summary: dict) -> dict:
         "graph_summary": graph.get("summary", {}),
         "inventory": inventory,
         "artifacts": {"sbom": graph.get("sbom_path"), "graph_json": graph_path,
-                      "graph_html": graph.get("graph_html")},
+                      "graph_html": graph.get("graph_html"),
+                      "risk_assessment": ctx.state.get("risk_assessment", {}).get("path"),
+                      "proposals": ctx.state.get("remediation", {}).get("path")},
+        "risk_assessment": ctx.state.get("risk_assessment", {}),
+        "remediation": ctx.state.get("remediation", {}),
         "scan_status": {
             "vulnerability": ctx.state.get("vulnerability", {}).get("status", "not_run"),
             "container_ci": ctx.state.get("container_ci", {}).get("status", "not_run"),
@@ -338,7 +352,7 @@ def _build_json(ctx: RunContext, findings: list[dict], summary: dict) -> dict:
             "suspicious": ctx.state.get("suspicious", {}).get("status", "not_run"),
             "branch_comparison": ctx.state.get("suspicious", {}).get("branch_comparison", "not_run"),
         },
-        "validation": {"status": "not_performed_day_1"},
+        "validation": {"status": "not_run", "reason": "sandbox stage pending"},
         "ecosystems": recon.get("ecosystems", []),
         "findings": _sorted_findings(findings),
         "skipped_findings": ctx.state.get("skipped_findings", []),

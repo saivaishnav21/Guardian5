@@ -148,8 +148,10 @@ demo; no open-ended agent debate.
 Keep **risk confidence**, **proposal confidence**, and **validation result**
 separate. Proposal confidence is based on verified signals: known fix source,
 correct dependency owner, compatible constraints, narrow patch, and explicit
-rollback. Treat an initial threshold such as `>= 0.85` as a configurable demo
-gate, not a calibrated probability.
+rollback. The current demo routes bounded upgrade candidates at `>= 70/100`
+to a sandbox trial; the value is configurable in `guardian/approval_policy.json`
+and is not a calibrated probability. Compatibility remains untested until the
+sandbox runs.
 
 If required signals pass and proposal confidence meets the threshold, the system
 may automatically try the patch **only inside Person 4's disposable sandbox**.
@@ -162,9 +164,9 @@ Person 3's simple Streamlit review view should display the exact diff, source
 finding, evidence challenge, confidence factors, build/tests, before/after scan,
 remaining risk, and rollback. Buttons record `approve`, `reject`, or
 `request_changes`; they do not apply the patch. Tie approval to `baseline_commit`
-and `patch_sha256`, and invalidate it if either changes. A typed reviewer name is
-only a declared identity in a demo; do not present it as authenticated approval
-without an actual identity system.
+and `patch_sha256`, and invalidate it if either changes. The local demo records
+an unauthenticated human decision without asking for a reviewer name; do not
+present that decision as authenticated approval without an identity system.
 
 ## Person 4: sandbox that can give a meaningful answer
 
