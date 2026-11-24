@@ -11,7 +11,7 @@ Run:
     streamlit run guardian/app.py
 
 Environment variable (optional):
-    GROQ_API_KEY=<key>   – enables AI prose explanations in the Evidence
+    GROQ_API_KEY=<key>   – enables optional AI advisory in the Evidence
                                 & Risk Agent.  The dashboard never displays the
                                 key; it is read exclusively from the environment.
 """
@@ -617,6 +617,7 @@ def _init_state() -> None:
         "json_path":  None,
         "run_error":  None,
         "last_repo":  "",
+        "repo_input": _SAMPLE_REPOS[0],
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default
@@ -655,6 +656,10 @@ def _run_pipeline(repo_url: str) -> None:
 # Sidebar
 # ---------------------------------------------------------------------------
 
+def _select_repo(repo_url: str) -> None:
+    st.session_state.repo_input = repo_url
+
+
 def _sidebar() -> str | None:
     """Render sidebar. Returns repo URL to scan or None."""
     with st.sidebar:
@@ -669,25 +674,25 @@ def _sidebar() -> str | None:
         st.subheader("🔍 Scan a Repository")
         repo_url = st.text_input(
             "Public GitHub URL",
-            value=st.session_state.get("last_repo", _SAMPLE_REPOS[0]),
+            key="repo_input",
             placeholder="https://github.com/owner/repo.git",
         )
 
         st.caption("Quick picks:")
         for sample in _SAMPLE_REPOS:
-            if st.button(sample.split("/")[-1].replace(".git", ""), key=f"btn_{sample}"):
-                repo_url = sample
+            st.button(sample.split("/")[-1].replace(".git", ""), key=f"btn_{sample}",
+                      on_click=_select_repo, args=(sample,))
 
         if groq_key():
-            st.success("🤖 AI explanations: **enabled**")
+            st.success("🤖 AI advisory: **enabled**")
         else:
-            st.info("🤖 AI explanations: **disabled**\n\nSet `GROQ_API_KEY` env var to enable.")
+            st.info("🤖 AI advisory: **disabled**\n\nSet `GROQ_API_KEY` env var to enable.")
 
         st.divider()
         st.caption("Day 1 prototype")
 
         scan_clicked = st.button("🚀 Run Scan", type="primary", use_container_width=True)
-        return repo_url if scan_clicked else None
+        return repo_url.strip() if scan_clicked else None
 
 
 # ---------------------------------------------------------------------------
@@ -748,11 +753,11 @@ def _render_findings(ctx) -> None:
         )
         return
 
-    # Sort by risk
+    # Review order may be raised by AI; scanner risk is displayed separately.
     sorted_findings = sorted(
         findings,
         key=lambda f: (
-            _RISK_ORDER.get(f.get("risk_level", "unrated"), 99),
+            _RISK_ORDER.get(f.get("review_priority", f.get("risk_level", "unrated")), 99),
             f.get("id", ""),
         ),
     )
@@ -824,10 +829,18 @@ def _render_findings(ctx) -> None:
                 st.markdown("**Remediation:**")
                 st.warning(f.get("remediation"))
 
-            # AI explanation
-            if f.get("ai_explanation"):
-                st.markdown("**AI draft** *(unverified prose; review claims against evidence)*:")
-                st.info(f.get("ai_explanation"))
+            risk_ai = f.get("ai_assessment") or {}
+            suspicious_ai = f.get("ai_suspicious") or {}
+            if risk_ai.get("status") == "completed" or suspicious_ai.get("status") == "completed":
+                st.markdown("**🤖 AI Advisory — not verified**")
+                if risk_ai.get("status") == "completed":
+                    st.info(f"Suggested review priority: {risk_ai['priority']}. {risk_ai['reason']}")
+                    st.caption("Evidence references: " + ", ".join(risk_ai["evidence_refs"])
+                               + "; unknown: " + (", ".join(risk_ai["unknowns"]) or "none listed"))
+                if suspicious_ai.get("status") == "completed":
+                    st.info(f"Hypothesis: {suspicious_ai['hypothesis']}")
+                    st.caption(f"Check next: {suspicious_ai['check_next']}; evidence references: "
+                               + ", ".join(suspicious_ai["evidence_refs"]))
 
             # Notes
             notes = f.get("notes", [])
@@ -960,8 +973,9 @@ def main() -> None:
 ### Responsible AI
 
 - Risk levels are computed **deterministically** — never by an AI model.
-- Optional Groq calls suggest unknown manifests and explain a few existing findings.
-- AI prose with new CVE IDs is discarded; other claims still need human review.
+- Optional Groq calls suggest unknown manifests, review risk priority, and suggest checks for suspicious changes.
+- **🤖 AI Advisory — not verified** is separate from scanner facts. AI may raise review order but cannot change scanner risk.
+- New CVE IDs, versions, and unsupported evidence references are rejected; other claims still need human review.
 - API keys are **never** logged, displayed, or stored in reports.
 
 ### Prerequisites

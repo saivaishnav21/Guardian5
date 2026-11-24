@@ -24,8 +24,10 @@ evidence. Vulnerability findings include a graph path when Grype's package URL c
 be matched to a graph node.
 
 Groq is optional. Recon sends only filenames for unfamiliar manifest suggestions.
-The evidence agent can generate prose for up to five findings; this prose does not
-set risk levels. Scanner output and source files are the evidence sources.
+Groq can review up to six findings for priority and five suspicious findings for
+hypotheses and next checks. These unverified advisories cannot change scanner risk;
+validated priority suggestions can only raise review order. Scanner output and
+source files are the evidence sources.
 
 ## Scope and approval points
 

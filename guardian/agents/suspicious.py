@@ -1,12 +1,11 @@
 import json
 import os
 import subprocess
-import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import Mapping
 
 from guardian.agents.base import RunContext
+from guardian.ai_review import review as ai_review
 from guardian.schemas import Finding
 from guardian.secrets import scanner_env
 
@@ -20,105 +19,6 @@ AGENT = "Suspicious Investigation Agent"
 LIFECYCLE_SCRIPTS = {
     "preinstall", "install", "postinstall", "prepublish", "prepare",
 }
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-
-def _groq_api_key() -> str:
-    configured = os.getenv("GROQ_API_KEY", "").strip()
-    if configured:
-        return configured
-
-    source = Path(__file__).resolve()
-    candidates = (
-        source.parents[2] / "api.txt",
-        source.parents[3] / "api.txt",
-    )
-    for path in candidates:
-        if path.is_file():
-            value = path.read_text(encoding="utf-8").strip()
-            if value:
-                return value
-    return ""
-
-
-def enrich_findings_with_groq(findings: list[Finding]) -> list[Finding]:
-    """Use Groq only to explain/prioritize existing deterministic findings."""
-    api_key = _groq_api_key()
-    if not api_key or not findings:
-        return findings
-
-    prompt_payload = [
-        {
-            "title": finding.title,
-            "component": finding.component,
-            "severity": finding.severity,
-            "evidence": finding.evidence,
-        }
-        for finding in findings
-    ]
-    prompt = (
-        "You enrich supply-chain security findings. "
-        "Use only the provided evidence. Do not claim facts not present. "
-        "Return a JSON array with one object per input finding containing "
-        "risk_level ('low', 'medium', 'high', or 'critical'), "
-        "ai_summary, and ai_recommended_action.\n"
-        f"Findings: {json.dumps(prompt_payload, ensure_ascii=False)}"
-    )
-    body = json.dumps({
-        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Return only valid JSON. Be conservative and evidence-grounded."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-    }).encode("utf-8")
-
-    request = urllib.request.Request(
-        GROQ_API_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-        content = response_data["choices"][0]["message"]["content"]
-        enrichment = json.loads(content)
-        if isinstance(enrichment, dict):
-            values = enrichment.get("findings", enrichment)
-            if isinstance(values, dict):
-                values = list(values.values())
-        else:
-            values = enrichment
-        if not isinstance(values, list):
-            return findings
-    except (urllib.error.URLError, urllib.error.HTTPError,
-            json.JSONDecodeError, KeyError, TimeoutError, OSError):
-        return findings
-
-    for finding, item in zip(findings, values):
-        if not isinstance(item, dict):
-            continue
-        risk = str(item.get("risk_level", "")).lower()
-        if risk in {"low", "medium", "high", "critical"}:
-            finding.risk_level = risk
-        summary = item.get("ai_summary")
-        action = item.get("ai_recommended_action")
-        finding.notes.append(str(summary)) if summary else None
-        if action:
-            finding.evidence["groq_recommended_action"] = str(action)
-    return findings
-
-
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -854,10 +754,18 @@ def run(ctx: RunContext) -> None:
     for finding in findings:
         ctx.add_finding(finding)
 
+    ai_reviews = {
+        finding.id: ai_review("suspicious", finding.to_dict())
+        for finding in findings[:5]
+    }
+    ctx.state["ai_suspicious"] = ai_reviews
+    ctx.save("suspicious_ai.json", ai_reviews)
+
     ctx.state["suspicious"] = {
         "status": "completed_static",
         "branch_comparison": "completed" if branch_available else "not_available",
         "finding_count": len(findings),
+        "ai_reviewed": sum(item["status"] == "completed" for item in ai_reviews.values()),
         "tampered_branch": tampered_branch,
     }
     ctx.save("suspicious.json", ctx.state["suspicious"])
