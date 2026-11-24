@@ -952,7 +952,7 @@ def main() -> None:
 1. **Recon Agent** – clones the repo and identifies ecosystems, Dockerfiles, CI workflows.
 2. **SBOM & Graph Agent** – generates a CycloneDX SBOM and builds a dependency graph.
 3. **Vulnerability Agent** – matches SBOM components with Grype and traces dependency paths.
-4. **Suspicious Change Agent** – checks npm package metadata and lockfile changes.
+4. **Suspicious Investigation Agent** – checks npm package metadata and lockfile changes.
 5. **Container & CI Agent** – inspects Docker, Compose, and GitHub workflow files.
 6. **Evidence & Risk Agent** – validates findings and assigns initial risk levels.
 7. **Report Generator** – produces Markdown and JSON reports.

@@ -7,7 +7,7 @@ PIPELINE = [
     ("Recon Agent", recon.run),
     ("SBOM & Graph Agent", sbom_graph.run),
     ("Vulnerability Agent", vulnerability.run),
-    ("Suspicious Change Agent", suspicious.run),
+    ("Suspicious Investigation Agent", suspicious.run),
     ("Container & CI Agent", container_ci.run),
     ("Evidence & Risk Agent", evidence_risk.run),
 ]

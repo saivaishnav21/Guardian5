@@ -16,7 +16,7 @@ except ImportError:
     WRatio = None
 
 
-AGENT = "Suspicious Change Agent"
+AGENT = "Suspicious Investigation Agent"
 LIFECYCLE_SCRIPTS = {
     "preinstall", "install", "postinstall", "prepublish", "prepare",
 }
@@ -396,6 +396,224 @@ def lockfile_diff(before: Mapping, after: Mapping) -> list[dict]:
                 },
             })
     return findings
+
+
+def list_manifest_commits(repo: str | Path) -> list[str]:
+    """List commits that edited package.json or package-lock.json."""
+    repo = Path(repo)
+    result = _run_git(
+        repo,
+        "log",
+        "--follow",
+        "--oneline",
+        "--",
+        "package.json",
+        "package-lock.json",
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def read_json_at_commit(
+    repo: str | Path,
+    commit: str,
+    filename: str,
+) -> Mapping | None:
+    """Read and parse one JSON file at exactly one Git revision."""
+    repo = Path(repo)
+    result = _run_git(repo, "show", f"{commit}:{filename}")
+    if result.returncode != 0:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def detect_lockfile_commit_changes(
+    repo: str | Path,
+    base_commit: str,
+    head_commit: str,
+) -> list[dict]:
+    """Detect same-version integrity changes and non-registry resolutions."""
+    repo = Path(repo)
+    before = read_json_at_commit(repo, base_commit, "package-lock.json")
+    after = read_json_at_commit(repo, head_commit, "package-lock.json")
+    if before is None or after is None:
+        return []
+
+    before_entries = _package_entries(before)
+    after_entries = _package_entries(after)
+    findings = []
+
+    for package in sorted(set(before_entries) & set(after_entries)):
+        old = before_entries[package]
+        new = after_entries[package]
+        old_version = old.get("version")
+        new_version = new.get("version")
+
+        if (
+            old_version
+            and old_version == new_version
+            and old.get("integrity") != new.get("integrity")
+        ):
+            findings.append({
+                "type": "integrity_changed_same_version",
+                "package": package,
+                "severity": "high",
+                "evidence": {
+                    "file": "package-lock.json",
+                    "base_commit": base_commit,
+                    "head_commit": head_commit,
+                    "version": new_version,
+                    "base_integrity": old.get("integrity"),
+                    "head_integrity": new.get("integrity"),
+                },
+                "commit": head_commit,
+            })
+
+        resolved = new.get("resolved")
+        if isinstance(resolved, str) and resolved:
+            if not resolved.startswith("https://registry.npmjs.org/"):
+                findings.append({
+                    "type": "non_registry_source",
+                    "package": package,
+                    "severity": "high",
+                    "evidence": {
+                        "file": "package-lock.json",
+                        "base_commit": base_commit,
+                        "head_commit": head_commit,
+                        "resolved": resolved,
+                    },
+                    "commit": head_commit,
+                })
+
+    return findings
+
+
+def detect_manifest_commit_changes(
+    repo: str | Path,
+    base_commit: str,
+    head_commit: str,
+) -> list[dict]:
+    """Detect suspicious package.json script and dependency changes."""
+    repo = Path(repo)
+    before = read_json_at_commit(repo, base_commit, "package.json")
+    after = read_json_at_commit(repo, head_commit, "package.json")
+    if before is None or after is None:
+        return []
+
+    findings = []
+    for section in ("dependencies", "devDependencies"):
+        old_deps = before.get(section)
+        new_deps = after.get(section)
+        old_deps = old_deps if isinstance(old_deps, Mapping) else {}
+        new_deps = new_deps if isinstance(new_deps, Mapping) else {}
+        for package in sorted(set(old_deps) | set(new_deps)):
+            old_value = old_deps.get(package)
+            new_value = new_deps.get(package)
+            if old_value == new_value:
+                continue
+
+            values = (str(old_value or ""), str(new_value or ""))
+            suspicious = (
+                "*" in values
+                or any(
+                    value.startswith(("git+", "git://", "github:", "http://",
+                                      "https://", "ssh://", "file:"))
+                    for value in values
+                )
+            )
+            if suspicious:
+                findings.append({
+                    "type": "suspicious_package_manifest_change",
+                    "package": package,
+                    "severity": "high",
+                    "evidence": {
+                        "file": "package.json",
+                        "base_commit": base_commit,
+                        "head_commit": head_commit,
+                        "section": section,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                    },
+                    "commit": head_commit,
+                })
+
+    old_scripts = before.get("scripts")
+    new_scripts = after.get("scripts")
+    old_scripts = old_scripts if isinstance(old_scripts, Mapping) else {}
+    new_scripts = new_scripts if isinstance(new_scripts, Mapping) else {}
+    for script_name in sorted(set(old_scripts) | set(new_scripts)):
+        if script_name not in LIFECYCLE_SCRIPTS:
+            continue
+        old_command = old_scripts.get(script_name)
+        new_command = new_scripts.get(script_name)
+        if old_command != new_command:
+            script_file = None
+            if isinstance(new_command, str):
+                for token in new_command.split():
+                    candidate = repo / token
+                    if candidate.is_file():
+                        script_file = token
+                        break
+            findings.append({
+                "type": "package_script_changed",
+                "package": str(after.get("name") or "root-package"),
+                "severity": "high",
+                "evidence": {
+                    "file": "package.json",
+                    "base_commit": base_commit,
+                    "head_commit": head_commit,
+                    "script": script_name,
+                    "old_command": old_command,
+                    "new_command": new_command,
+                    "referenced_file": script_file,
+                },
+                "commit": head_commit,
+            })
+
+    return findings
+
+
+def list_commit_diffs(
+    repo: str | Path,
+    base_commit: str,
+    head_commit: str,
+) -> list[dict]:
+    """List relevant manifest commits and their subjects between two revisions."""
+    repo = Path(repo)
+    result = _run_git(
+        repo,
+        "log",
+        "--format=%H%x09%s",
+        f"{base_commit}..{head_commit}",
+        "--",
+        "package.json",
+        "package-lock.json",
+    )
+    if result.returncode != 0:
+        return []
+
+    mismatching_words = ("fix typo", "update docs", "documentation", "readme")
+    commits = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        commit, separator, subject = line.partition("\t")
+        if not separator:
+            continue
+        subject_lower = subject.lower()
+        commits.append({
+            "commit": commit,
+            "subject": subject,
+            "message_mismatch": any(
+                phrase in subject_lower for phrase in mismatching_words
+            ),
+        })
+    return commits
 
 
 def run(ctx: RunContext) -> None:
