@@ -14,6 +14,7 @@ The Day 1 pipeline is connected and has been run end to end on OWASP NodeGoat. T
 | Suspicious changes | Checks npm metadata and lockfiles for install scripts, unusual resolutions, lookalike names, and optional demo-branch changes | `suspicious.json` |
 | Container and CI | Checks Dockerfile, Compose, and workflow files; optionally scans an already-built local image with Trivy | `container_ci.json`, optional `trivy_image.json` |
 | Evidence and risk | Validates findings, assigns an initial severity-based risk level, and adds remediation guidance | `evidence_risk.json` |
+| Risk assessment (Day 2) | Groups duplicate findings and ranks them with a deterministic score from scanner severity plus observed context (scope, image scan, ownership); unmeasured factors are listed as unknowns | `risk_assessment.json` |
 | Reporting | Produces a short human-readable summary and a complete machine-readable record | `report.md`, `report.json` |
 
 The Streamlit app runs this pipeline and displays scan coverage, findings in pages of 20, the dependency graph, downloads, and agent logs. It does not implement a separate scanner.
@@ -84,3 +85,4 @@ See [Day 1 architecture](docs/architecture.md) and [Responsible AI and security]
 ## Repository hygiene
 
 Keep real API keys in `.env`; only `.env.example` belongs in Git. Generated `runs/`, local `target/`, virtual environment, caches, and scanner output are ignored. Fetch and review `origin/main` before integrating teammate work, then rebase local commits onto the latest `origin/main` before pushing.
+
