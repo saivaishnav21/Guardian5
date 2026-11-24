@@ -676,8 +676,9 @@ def _sidebar() -> str | None:
         repo_url = st.text_input(
             "Public GitHub URL",
             key="repo_input",
-            placeholder="https://github.com/owner/repo.git",
+            placeholder="https://github.com/owner/repo  or  .../tree/fix-branch",
         )
+        st.caption("Add `/tree/<branch>` to rescan a fix branch.")
 
         st.caption("Quick picks:")
         for sample in _SAMPLE_REPOS:
@@ -948,6 +949,117 @@ def _render_logs(ctx) -> None:
             st.markdown(f"**[{entry['agent']}]** {entry['message']}")
 
 
+def _render_sandbox_trials(ctx) -> None:
+    st.subheader("Sandbox trials")
+    files = sorted((ctx.run_dir / "sandbox").glob("*/validation.json"),
+                   key=lambda path: path.stat().st_mtime, reverse=True)
+    if not files:
+        st.caption("No isolated build/test trial has been run for this scan.")
+        return
+    records = []
+    for path in files:
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        records.append((path, result))
+    st.dataframe([{
+        "Finding": item.get("finding_id"), "Status": item.get("status"),
+        "Reason": item.get("reason"), "Patch SHA-256": item.get("patch_sha256"),
+    } for _, item in records], hide_index=True, width="stretch")
+    if records:
+        selected = st.selectbox("Trial evidence", range(len(records)),
+                                format_func=lambda i: records[i][0].parent.name)
+        path, result = records[selected]
+        st.caption("Trial status measures build/test evidence only. Rescan and final adoption are separate.")
+        st.json({key: result.get(key) for key in (
+            "status", "reason", "approval_mode", "baseline_commit", "image_id",
+            "changed_files", "patch_sha256", "steps", "post_trial_review",
+        ) if key in result})
+        st.download_button("Download validation record", path.read_bytes(),
+                           file_name="validation.json", mime="application/json")
+        patch = path.parent / "patch.diff"
+        if patch.is_file():
+            with st.expander("Exact candidate diff"):
+                st.code(patch.read_text(encoding="utf-8", errors="replace")[:20000], language="diff")
+                st.download_button("Download full diff", patch.read_bytes(),
+                                   file_name="patch.diff", mime="text/plain")
+        for name, step in (result.get("steps") or {}).items():
+            log_value = step.get("log") if isinstance(step, dict) else None
+            if not log_value:
+                continue
+            log_path = Path(log_value).resolve()
+            if log_path.is_file() and log_path.is_relative_to(path.parent.resolve()):
+                with st.expander(f"{name} log"):
+                    st.code(log_path.read_text(encoding="utf-8", errors="replace")[-20000:])
+
+
+_VERDICT_HELP = {
+    "clean": "No findings remain in the rescan.",
+    "improved": "Findings were resolved and none were introduced.",
+    "unchanged": "Nothing was resolved and nothing was introduced.",
+    "not_resolved": "The targeted finding is still reported after the change.",
+    "regressed": "The rescan reports findings the baseline did not.",
+    "inconclusive": "Scanner coverage differed, so the comparison is not trustworthy.",
+}
+
+
+def _render_verification(ctx) -> None:
+    """Before/after rescan result produced by guardian.verify."""
+    st.subheader("Before / after rescan")
+    path = ctx.run_dir / "comparison.json"
+    if not path.is_file():
+        st.caption(
+            "No rescan comparison for this run. Scan the fix branch "
+            "(`.../tree/<branch>`), then run: "
+            "`python -m guardian.verify <baseline_run> <this_run> --finding-id <ID>`"
+        )
+        return
+    result = _read_json(path)
+    if not isinstance(result, dict):
+        return
+
+    verdict = result.get("verdict", "unknown")
+    counts = result.get("counts", {})
+    banner = {"clean": st.success, "improved": st.success, "regressed": st.error,
+              "not_resolved": st.warning, "inconclusive": st.warning}.get(verdict, st.info)
+    banner(f"**{verdict.replace('_', ' ').title()}** — {result.get('summary', '')}")
+    st.caption(_VERDICT_HELP.get(verdict, ""))
+
+    cols = st.columns(3)
+    cols[0].metric("Resolved", counts.get("resolved", 0))
+    cols[1].metric("Still present", counts.get("still_present", 0))
+    cols[2].metric("Newly introduced", counts.get("newly_introduced", 0))
+
+    for label, key in (("Baseline", "baseline"), ("Candidate", "candidate")):
+        side = result.get(key) or {}
+        st.caption(f"**{label}:** `{side.get('ref') or '?'}` @ `{str(side.get('commit') or '?')[:8]}` · "
+                   f"{side.get('total_findings', 0)} findings · {side.get('unique_keys', 0)} unique")
+
+    target = result.get("target_finding")
+    if target:
+        st.write(f"**Targeted finding** `{target.get('finding_id')}` "
+                 f"({target.get('component', 'n/a')}): **{target.get('status')}**")
+
+    if result.get("incomparable_categories"):
+        st.warning("Not comparable: " + ", ".join(result["incomparable_categories"]))
+        for note in result.get("coverage_notes", []):
+            st.caption(f"· {note}")
+
+    if result.get("newly_introduced"):
+        with st.expander(f"Newly introduced ({len(result['newly_introduced'])})", expanded=True):
+            st.dataframe(result["newly_introduced"], hide_index=True, width="stretch")
+    if result.get("resolved"):
+        with st.expander(f"Resolved ({len(result['resolved'])})"):
+            st.dataframe(result["resolved"], hide_index=True, width="stretch")
+
+    with st.expander("Limitations of this comparison"):
+        for item in result.get("limitations", []):
+            st.caption(f"· {item}")
+    st.download_button("Download comparison.json", path.read_bytes(),
+                       file_name="comparison.json", mime="application/json")
+
+
 def _read_json(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -1194,13 +1306,34 @@ def main() -> None:
 
     ctx = st.session_state.ctx
     if ctx is not None and st.session_state.run_error is None:
-        st.caption(f"**Repository:** {ctx.repo_url}  ·  **Commit:** {ctx.state.get('recon', {}).get('commit', '?')}  ·  **Run:** {ctx.run_dir.name}")
+        _recon = ctx.state.get("recon", {})
+        st.caption(f"**Repository:** {ctx.repo_url}  ·  **Branch:** {_recon.get('checked_out_ref', '?')}  ·  "
+                   f"**Commit:** {_recon.get('commit', '?')}  ·  **Run:** {ctx.run_dir.name}")
         tabs = st.tabs(["Overview", "Prioritized risks", "Proposed fixes", "Human review", "Evidence & downloads"])
         with tabs[0]:
             _render_summary(ctx)
             remediation = ctx.state.get("remediation") or {}
+            trials = sorted((ctx.run_dir / "sandbox").glob("*/validation.json"),
+                            key=lambda path: path.stat().st_mtime, reverse=True)
+            if trials:
+                try:
+                    trial_status = json.loads(trials[0].read_text(encoding="utf-8")).get("status", "unknown")
+                except (OSError, ValueError):
+                    trial_status = "unreadable"
+                trial_summary = f"latest sandbox trial: {trial_status}"
+            else:
+                trial_summary = "sandbox validation pending"
+            comparison_path = ctx.run_dir / "comparison.json"
+            verify_summary = "rescan comparison pending"
+            if comparison_path.is_file():
+                try:
+                    verify_summary = ("rescan: "
+                                      + json.loads(comparison_path.read_text(encoding="utf-8"))
+                                      .get("verdict", "unknown"))
+                except (OSError, ValueError):
+                    verify_summary = "rescan: unreadable"
             st.info(f"{(ctx.state.get('risk_assessment') or {}).get('summary', {}).get('ranked_items', 0)} risks ranked · "
-                    f"{remediation.get('count', 0)} proposals generated · sandbox validation pending")
+                    f"{remediation.get('count', 0)} proposals generated · {trial_summary} · {verify_summary}")
         with tabs[1]:
             render_risks(ctx.run_dir)
         with tabs[2]:
@@ -1211,6 +1344,8 @@ def main() -> None:
             _render_findings(ctx)
             _render_graph(ctx)
             _render_downloads(ctx, st.session_state.md_path, st.session_state.json_path)
+            _render_sandbox_trials(ctx)
+            _render_verification(ctx)
             _render_logs(ctx)
     elif ctx is None and st.session_state.run_error is None:
         st.subheader("Start with a repository")

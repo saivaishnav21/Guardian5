@@ -8,8 +8,12 @@ from guardian.secrets import scanner_env
 
 AGENT = "Recon Agent"
 
-# Only public GitHub repos are accepted (sandbox rule: no outside infrastructure)
-URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+?(\.git)?/?$")
+# Only public GitHub repos are accepted (sandbox rule: no outside infrastructure).
+# A /tree/<ref> suffix selects one branch or tag so a fix branch can be rescanned.
+URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+?)(?:\.git)?"
+    r"(?:/tree/(?P<ref>[\w./-]+?))?/?$"
+)
 SKIP_DIRS = {".git", "node_modules"}
 
 ECOSYSTEM_FILES = {
@@ -27,19 +31,40 @@ PRIORITY_MANIFEST_SUFFIXES = {
 MAX_GROQ_CANDIDATES = 200
 
 
+def parse_repo_url(url: str) -> tuple[str, str | None]:
+    """Split an accepted GitHub URL into a clone URL and an optional branch/tag."""
+    match = URL_RE.match(str(url).strip())
+    if not match:
+        raise ValueError(
+            "Only public https://github.com/<owner>/<repo> URLs are allowed, "
+            "optionally with /tree/<branch>."
+        )
+    ref = match.group("ref")
+    if ref and (".." in ref or ref.startswith("/") or ref.endswith("/")):
+        raise ValueError("Branch or tag name is not valid.")
+    clone_url = f"https://github.com/{match.group('owner')}/{match.group('repo')}.git"
+    return clone_url, ref
+
+
 def run(ctx: RunContext) -> None:
     url = ctx.repo_url
-    if not URL_RE.match(url):
-        raise ValueError("Only public https://github.com/<owner>/<repo> URLs are allowed.")
+    clone_url, ref = parse_repo_url(url)
 
     dest = ctx.run_dir / "target"
-    ctx.note(AGENT, f"cloning {url} (shallow)")
-    subprocess.run(["git", "clone", "--depth", "1", url, str(dest)], check=True,
-                   env=scanner_env())
+    ctx.note(AGENT, f"cloning {clone_url} (shallow, ref={ref or 'default branch'})")
+    clone_cmd = ["git", "clone", "--depth", "1"]
+    if ref:
+        clone_cmd += ["--branch", ref]
+    clone_cmd += [clone_url, str(dest)]
+    subprocess.run(clone_cmd, check=True, env=scanner_env())
     commit = subprocess.run(
         ["git", "-C", str(dest), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True, env=scanner_env(),
     ).stdout.strip()
+    checked_out = subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=False, env=scanner_env(),
+    ).stdout.strip() or "HEAD"
 
     found = {"manifests": [], "dockerfiles": [], "compose_files": [], "ci_workflows": []}
     ecosystems = set()
@@ -86,6 +111,9 @@ def run(ctx: RunContext) -> None:
 
     recon = {
         "repo_url": url,
+        "clone_url": clone_url,
+        "requested_ref": ref,
+        "checked_out_ref": checked_out,
         "commit": commit,
         "target_dir": str(dest),
         "ecosystems": sorted(ecosystems),
@@ -95,5 +123,5 @@ def run(ctx: RunContext) -> None:
     }
     ctx.state["recon"] = recon
     ctx.save("recon.json", recon)
-    ctx.note(AGENT, f"commit {commit[:8]}, ecosystems={sorted(ecosystems)}, "
+    ctx.note(AGENT, f"ref {checked_out} @ {commit[:8]}, ecosystems={sorted(ecosystems)}, "
                     f"dockerfiles={len(found['dockerfiles'])}, workflows={len(found['ci_workflows'])}")

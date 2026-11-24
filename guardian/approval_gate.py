@@ -1,17 +1,16 @@
-"""Suspicious Investigation policy, review records, and approval gate."""
+"""Proposal integrity, human preflight review, and sandbox trial gating."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import uuid
 import os
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Mapping
 
 try:
     from guardian.secrets import groq_key, groq_model
@@ -37,121 +36,12 @@ def load_policy(path: str | Path = DEFAULT_POLICY_PATH) -> dict:
     return policy
 
 
-def policy_verdict(findings: Iterable[Mapping], policy: Mapping | None = None) -> str:
-    policy = policy or load_policy()
-    severity_map = policy.get("severity_verdict", {})
-    if not isinstance(severity_map, Mapping):
-        raise ValueError("policy severity_verdict must be a JSON object")
-
-    severities = [
-        str(finding.get("severity", "low")).lower()
-        for finding in findings
-        if isinstance(finding, Mapping)
-    ]
-    if not severities:
-        return str(severity_map.get("none", "allow_logged"))
-
-    verdict_order = {
-        "allow_logged": 0,
-        "needs_review": 1,
-        "needs_review_blocking": 2,
-    }
-    verdicts = [
-        str(severity_map.get(severity, "needs_review"))
-        for severity in severities
-    ]
-    return max(verdicts, key=lambda verdict: verdict_order.get(verdict, 0))
-
-
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def git_head(repo: str | Path) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "could not determine git HEAD")
-    return result.stdout.strip()
-
-
-def create_review_record(
-    *,
-    proposal_id: str,
-    reviewer_id: str,
-    reviewer_type: str,
-    patch_file: str | Path,
-    repo: str | Path,
-    validation: Mapping,
-    signal: Mapping,
-    decision: str,
-    comment: str,
-    ai_advice: Mapping | None = None,
-    policy: Mapping | None = None,
-    decided_at: str | None = None,
-) -> dict:
-    policy = policy or load_policy()
-    allowed = set(policy.get("allowed_decisions", ALLOWED_DECISIONS))
-    if decision not in allowed:
-        raise ValueError(f"decision must be one of: {sorted(allowed)}")
-    if reviewer_type != "human":
-        raise ValueError("approval reviewer must be human")
-    approved_reviewers = set(policy.get("approved_reviewers", []))
-    if reviewer_id not in approved_reviewers:
-        raise PermissionError("reviewer is not approved")
-    if decision == "approve" and str(validation.get("status", "")).lower() != "passed":
-        raise PermissionError("approve requires validation status passed")
-
-    patch_path = Path(patch_file)
-    if not patch_path.is_file():
-        raise FileNotFoundError(patch_path)
-
-    return {
-        "review_id": str(uuid.uuid4()),
-        "proposal_id": proposal_id,
-        "reviewer": {
-            "id": reviewer_id,
-            "type": "human",
-        },
-        "baseline_commit": git_head(repo),
-        "patch_sha256": sha256_file(patch_path),
-        "validation": dict(validation),
-        "signal": dict(signal),
-        "ai_advice": dict(ai_advice) if ai_advice else None,
-        "decision": decision,
-        "comment": comment,
-        "decided_at": decided_at or utc_now(),
-        "gate_status": "valid",
-    }
-
-
-def save_review_record(review: Mapping, run_dir: str | Path) -> Path:
-    if not isinstance(review, Mapping):
-        raise ValueError("review must be a mapping")
-    run_path = Path(run_dir)
-    run_path.mkdir(parents=True, exist_ok=True)
-    path = run_path / "reviews.json"
-
-    records = []
-    if path.is_file():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, list):
-                records = existing
-        except json.JSONDecodeError:
-            records = []
-
-    records.append(dict(review))
-    path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
-    return path
 
 
 def load_proposals(path: str | Path) -> list[dict]:
@@ -489,61 +379,3 @@ def create_ai_advice(
         "confidence": confidence,
         "limitations": limitations,
     }
-
-
-def may_apply(
-    review: Mapping,
-    patch_file: str | Path,
-    repo: str | Path,
-    policy: Mapping | None = None,
-) -> list[str]:
-    policy = policy or load_policy()
-    reasons = []
-
-    if review.get("decision") != "approve":
-        reasons.append("decision is not approve")
-
-    validation = review.get("validation")
-    if not isinstance(validation, Mapping) or validation.get("status") != "passed":
-        reasons.append("validation is not passed")
-
-    patch_path = Path(patch_file)
-    if not patch_path.is_file():
-        reasons.append("patch file missing")
-    elif sha256_file(patch_path) != review.get("patch_sha256"):
-        reasons.append("patch changed")
-
-    try:
-        current_head = git_head(repo)
-    except RuntimeError:
-        reasons.append("baseline commit changed")
-    else:
-        if current_head != review.get("baseline_commit"):
-            reasons.append("baseline commit changed")
-
-    reviewer = review.get("reviewer")
-    if not isinstance(reviewer, Mapping):
-        reasons.append("reviewer is missing")
-    else:
-        if reviewer.get("type") != "human":
-            reasons.append("reviewer is not human")
-        approved_reviewers = set(policy.get("approved_reviewers", []))
-        if reviewer.get("id") not in approved_reviewers:
-            reasons.append("reviewer is not approved")
-
-    decided_at = review.get("decided_at")
-    try:
-        decided = datetime.fromisoformat(str(decided_at).replace("Z", "+00:00"))
-        expiry_hours = int(policy.get("approval_expiry_hours", 24))
-        if datetime.now(timezone.utc) - decided.astimezone(timezone.utc) > timedelta(
-            hours=expiry_hours
-        ):
-            reasons.append("approval expired")
-    except (TypeError, ValueError, OverflowError):
-        reasons.append("approval timestamp invalid")
-
-    if reasons:
-        review["gate_status"] = "expired" if "approval expired" in reasons else "invalidated"
-    else:
-        review["gate_status"] = "valid"
-    return reasons

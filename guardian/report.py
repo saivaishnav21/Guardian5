@@ -85,6 +85,27 @@ def _cell(value: object) -> str:
     return " ".join(str(value).split()).replace("|", "\\|").replace("`", "\\`")
 
 
+def _latest_validation(ctx: RunContext) -> dict | None:
+    """Most recent sandbox build/test record for this run, if any."""
+    try:
+        from guardian.verify import latest_validation
+        return latest_validation(ctx.run_dir)
+    except Exception:  # noqa: BLE001 - reporting must never fail on optional evidence
+        return None
+
+
+def _comparison(ctx: RunContext) -> dict | None:
+    """Before/after rescan result written by guardian.verify, if any."""
+    path = ctx.run_dir / "comparison.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _sorted_findings(findings: list[dict]) -> list[dict]:
     return sorted(
         findings,
@@ -115,6 +136,8 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
         f"**Generated:** {now}",
         f"**Repository:** {ctx.repo_url}",
     ]
+    if recon.get("checked_out_ref"):
+        lines.append(f"**Branch/tag:** `{recon['checked_out_ref']}`")
     if recon.get("commit"):
         lines.append(f"**Commit:** `{recon['commit']}`")
     lines.append("")
@@ -155,7 +178,21 @@ def _build_markdown(ctx: RunContext, findings: list[dict], summary: dict) -> str
         lines.append(f"- **{label}:** {status}")
     lines.append(f"- **Demo branch comparison:** {ctx.state.get('suspicious', {}).get('branch_comparison', 'not_run')}")
     lines.append(f"- **Local image scan:** {ctx.state.get('container_ci', {}).get('image_scan_status', 'not_run')}")
-    lines += ["- **Sandbox validation:** not run", ""]
+    validation = _latest_validation(ctx)
+    if validation:
+        lines.append(f"- **Sandbox validation:** {validation.get('status', 'unknown')} "
+                     f"({validation.get('finding_id', '?')}) — {validation.get('reason', '')}")
+    else:
+        lines.append("- **Sandbox validation:** not run")
+    comparison = _comparison(ctx)
+    if comparison:
+        counts = comparison.get("counts", {})
+        lines.append(f"- **Before/after rescan:** {comparison.get('verdict', 'unknown')} — "
+                     f"{counts.get('resolved', 0)} resolved, {counts.get('still_present', 0)} remain, "
+                     f"{counts.get('newly_introduced', 0)} newly introduced")
+    else:
+        lines.append("- **Before/after rescan:** not run")
+    lines.append("")
 
     assessment = ctx.state.get("risk_assessment", {})
     remediation = ctx.state.get("remediation", {})
@@ -333,6 +370,8 @@ def _build_json(ctx: RunContext, findings: list[dict], summary: dict) -> dict:
             "schema_version": "1.0",
             "generated_at":   datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "repo_url":       ctx.repo_url,
+            "ref":            recon.get("checked_out_ref"),
+            "requested_ref":  recon.get("requested_ref"),
             "commit":         recon.get("commit"),
             "run_dir":        str(ctx.run_dir),
         },
@@ -352,7 +391,18 @@ def _build_json(ctx: RunContext, findings: list[dict], summary: dict) -> dict:
             "suspicious": ctx.state.get("suspicious", {}).get("status", "not_run"),
             "branch_comparison": ctx.state.get("suspicious", {}).get("branch_comparison", "not_run"),
         },
-        "validation": {"status": "not_run", "reason": "sandbox stage pending"},
+        "validation": ({
+            "status": _v.get("status"), "reason": _v.get("reason"),
+            "finding_id": _v.get("finding_id"), "approval_mode": _v.get("approval_mode"),
+            "patch_sha256": _v.get("patch_sha256"), "artifact": _v.get("artifact"),
+        } if (_v := _latest_validation(ctx)) else
+            {"status": "not_run", "reason": "no sandbox trial for this run"}),
+        "verification": ({
+            "verdict": _c.get("verdict"), "summary": _c.get("summary"),
+            "counts": _c.get("counts"), "target_finding": _c.get("target_finding"),
+            "artifact": str(ctx.run_dir / "comparison.json"),
+        } if (_c := _comparison(ctx)) else
+            {"verdict": "not_run", "summary": "no before/after rescan for this run"}),
         "ecosystems": recon.get("ecosystems", []),
         "findings": _sorted_findings(findings),
         "skipped_findings": ctx.state.get("skipped_findings", []),
