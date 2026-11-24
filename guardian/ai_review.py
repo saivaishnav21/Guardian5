@@ -2,8 +2,16 @@
 
 import json
 import re
+import urllib.error
+import urllib.request
 
-from guardian.secrets import groq_key, groq_model
+from guardian.secrets import (
+    deepseek_base_url,
+    deepseek_key,
+    deepseek_model,
+    groq_key,
+    groq_model,
+)
 
 EVIDENCE_FIELDS = (
     "tool", "vulnerability_id", "cve_ids", "severity", "purl",
@@ -122,14 +130,6 @@ def review(kind: str, finding: dict) -> dict:
     """Return a checked AI advisory or an explicit fallback status."""
     if kind not in {"risk", "suspicious"}:
         raise ValueError(f"Unsupported AI review kind: {kind}")
-    key = groq_key()
-    if not key:
-        return _empty(kind, "not_run_no_key")
-    try:
-        from groq import Groq
-    except ImportError:
-        return _empty(kind, "not_run_missing_package")
-
     source, allowed_refs = _payload(finding)
     fields = (
         '{"priority":"critical|high|medium|low|unrated","reason":"brief evidence-based reason",'
@@ -152,24 +152,62 @@ def review(kind: str, finding: dict) -> dict:
         "Leave ai_negotiation_log empty; negotiation is not implemented. "
         "This is an unverified advisory, not permission to change scanner findings."
     )
-    try:
-        client = Groq(api_key=key, timeout=15.0, max_retries=0)
-    except Exception as exc:
-        return _error(kind, exc)
+    groq_available = bool(groq_key())
+    deepseek_available = bool(deepseek_key())
+    if not groq_available and not deepseek_available:
+        return _empty(kind, "not_run_no_key")
+
     for attempt in range(2):
         try:
-            response = client.chat.completions.create(
-                model=groq_model(), temperature=0, max_completion_tokens=1200,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": instructions + (
-                        " Your previous response failed validation; use only input evidence and the exact schema."
-                        if attempt else ""
-                    )},
-                    {"role": "user", "content": json.dumps(source, ensure_ascii=False)},
-                ],
-            )
-            raw = json.loads(response.choices[0].message.content or "")
+            messages = [
+                {"role": "system", "content": instructions + (
+                    " Your previous response failed validation; use only input evidence and the exact schema."
+                    if attempt else ""
+                )},
+                {"role": "user", "content": json.dumps(source, ensure_ascii=False)},
+            ]
+            content = None
+            groq_error = None
+
+            if groq_available:
+                try:
+                    from groq import Groq
+                    client = Groq(api_key=groq_key(), timeout=15.0, max_retries=0)
+                    response = client.chat.completions.create(
+                        model=groq_model(),
+                        temperature=0,
+                        max_completion_tokens=1200,
+                        response_format={"type": "json_object"},
+                        messages=messages,
+                    )
+                    content = response.choices[0].message.content or ""
+                except Exception as exc:
+                    groq_error = exc
+
+            if content is None and deepseek_available:
+                body = json.dumps({
+                    "model": deepseek_model(),
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                    "max_tokens": 1200,
+                }).encode("utf-8")
+                request = urllib.request.Request(
+                    f"{deepseek_base_url()}/chat/completions",
+                    data=body,
+                    headers={
+                        "Authorization": f"Bearer {deepseek_key()}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                content = payload["choices"][0]["message"]["content"] or ""
+
+            if content is None:
+                return _error(kind, groq_error or RuntimeError("No AI provider available"))
+            raw = json.loads(content)
         except Exception as exc:
             return _error(kind, exc)
         result = _validate(kind, raw, source, allowed_refs)

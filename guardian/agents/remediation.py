@@ -1,12 +1,20 @@
 import json
 import hashlib
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from groq import Groq
 
 from guardian.agents.base import RunContext
-from guardian.secrets import groq_key, groq_model
+from guardian.secrets import (
+    deepseek_base_url,
+    deepseek_key,
+    deepseek_model,
+    groq_key,
+    groq_model,
+)
 
 AGENT = "remediation"
 
@@ -72,8 +80,6 @@ def _confidence_score(item: dict, proposal: dict) -> dict:
 def _ask_groq(item: dict, target_version: str) -> str:
     """Ask Groq LLM to write a human readable explanation.
     LLM only explains - never generates CVE IDs or versions."""
-    client = Groq(api_key=groq_key())
-
     prompt = (
         f"You are a security advisor. "
         f"The package {item['component']} has vulnerability "
@@ -86,13 +92,39 @@ def _ask_groq(item: dict, target_version: str) -> str:
         f"and what risk it eliminates. "
         f"Do not invent any CVE IDs, versions or package names."
     )
+    if groq_key():
+        try:
+            client = Groq(api_key=groq_key())
+            response = client.chat.completions.create(
+                model=groq_model(),
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content
+        except Exception:
+            pass
 
-    response = client.chat.completions.create(
-        model=groq_model(),
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
+    if deepseek_key():
+        body = json.dumps({
+            "model": deepseek_model(),
+            "temperature": 0,
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{deepseek_base_url()}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {deepseek_key()}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload["choices"][0]["message"]["content"]
+
+    raise RuntimeError("No AI provider key configured")
 
 
 def _validate_llm_output(text: str, cve_id: str) -> bool:
